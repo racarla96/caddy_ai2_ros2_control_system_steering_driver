@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="steering_robot">
+
+  <!-- Argumento para la frecuencia del controller manager -->
+  <xacro:arg name="controller_manager_frequency_hz" default="100"/>
+
+  <xacro:include filename="$(find caddy_ai2_ros2_control_system_steering_driver)/description/ros2_control/system_steering.ros2_control.urdf" />
+
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.5 0.3 0.1"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="steering_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.05" length="0.2"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="steering_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="steering_link"/>
+    <origin xyz="0.2 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.785" upper="0.785" effort="100" velocity="1.0"/>
+  </joint>
+
+</robot>
