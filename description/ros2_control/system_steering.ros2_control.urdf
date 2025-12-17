@@ -4,17 +4,18 @@
   <ros2_control name="steering_system" type="system">
     <hardware>
       <plugin>caddy_ai2_ros2_control_system_steering_driver/SystemSteeringHardware</plugin>
-      <param name="interface_name">vcan_steer_drv</param>
+      <param name="interface_name">can_steer_drv</param>
       <param name="controller_manager_frequency_hz">$(arg controller_manager_frequency_hz)</param>
-      <param name="hardware_sample_frequency_hz">50</param>
+      <param name="hardware_sample_frequency_hz">500</param>
       <param name="read_multiplicity">1</param>
-      <param name="write_multiplicity">1</param>
+      <param name="write_multiplicity">10</param>
       <param name="read_offset">0</param>
-      <param name="write_offset">0</param>
+      <param name="write_offset">1</param>
     </hardware>
     <joint name="steering_joint">
       <command_interface name="position"/>
       <state_interface name="position"/>
+      <state_interface name="velocity"/>
     </joint>
   </ros2_control>
 
