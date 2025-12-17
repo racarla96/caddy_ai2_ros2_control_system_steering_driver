@@ -1,9 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="steering_robot">
 
-  <!-- Argumento para la frecuencia del controller manager -->
-  <xacro:arg name="controller_manager_frequency_hz" default="100"/>
-
   <xacro:include filename="$(find caddy_ai2_ros2_control_system_steering_driver)/description/ros2_control/system_steering.ros2_control.urdf" />
 
   <link name="base_link">
