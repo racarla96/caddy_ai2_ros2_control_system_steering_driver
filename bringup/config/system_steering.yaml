@@ -4,11 +4,7 @@ controller_manager:
 
     system_steering_controller:
       type: position_controllers/JointGroupPositionController
+      joints: ["steering_joint"]
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
-
-system_steering_controller:
-  ros__parameters:
-    joints:
-      - steering_joint

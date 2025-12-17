@@ -77,7 +77,7 @@ def generate_launch_description():
     system_steering_controller_spawner = Node(
         package="controller_manager",
         executable="spawner",
-        arguments=["steering_controller"],
+        arguments=["system_steering_controller"],
         output="screen",
     )
 
