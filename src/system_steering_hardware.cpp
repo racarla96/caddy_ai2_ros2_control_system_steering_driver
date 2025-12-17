@@ -9,7 +9,7 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
 
-#include "caddy_ai2_ros2_control_system_steering_driver/socket_can_interface.hpp"
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 #include "caddy_ai2_ros2_control_system_steering_driver/canopen_driver.hpp"
 #include "caddy_ai2_ros2_control_system_steering_driver/motor_driver.hpp"
 #include "caddy_ai2_ros2_control_system_steering_driver/encoder_driver.hpp"

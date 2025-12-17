@@ -1,9 +1,14 @@
-cmake_minimum_required(VERSION 3.16)
-project(caddy_ai2_ros2_control_system_steering_driver)
+# Copyright (c) 2025 Rafael Carbonell Lázaro (racarla96)
+# Licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0)
+# See: https://creativecommons.org/licenses/by/4.0/
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "(GNU|Clang)")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
+cmake_minimum_required(VERSION 3.16)
+project(caddy_ai2_ros2_control_system_steering_driver LANGUAGES CXX)
+
+# Establecer el estándar C++20 para todo el proyecto
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS ON)
 
 # find dependencies
 set(THIS_PACKAGE_INCLUDE_DEPENDS
@@ -11,6 +16,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  caddy_ai2_ros2_common
 )
 
 find_package(ament_cmake REQUIRED)
@@ -23,17 +29,20 @@ add_library(
   ${PROJECT_NAME}
   SHARED
   src/system_steering_hardware.cpp
-  src/socket_can_interface.cpp
   src/canopen_driver.cpp
   src/motor_driver.cpp
   src/encoder_driver.cpp
   src/steering_controller.cpp
 )
 
-target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+)
+
+# Add caddy_ai2_ros2_common headers
+target_include_directories(${PROJECT_NAME} PUBLIC
+  ${caddy_ai2_ros2_common_INCLUDE_DIRS}
 )
 
 ament_target_dependencies(

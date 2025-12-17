@@ -1,5 +1,4 @@
-#ifndef CADDY_AI2_ROS2_CONTROL_SYSTEM_STEERING_DRIVER__SYSTEM_STEERING_HARDWARE_HPP_
-#define CADDY_AI2_ROS2_CONTROL_SYSTEM_STEERING_DRIVER__SYSTEM_STEERING_HARDWARE_HPP_
+#pragma once
 
 #include <memory>
 #include <string>
@@ -79,5 +78,3 @@ private:
 };
 
 }  // namespace caddy_ai2_ros2_control_system_steering_driver
-
-#endif  // CADDY_AI2_ROS2_CONTROL_SYSTEM_STEERING_DRIVER__SYSTEM_STEERING_HARDWARE_HPP_

@@ -1,11 +1,11 @@
-// encoder_driver.hpp
-#ifndef ENCODER_DRIVER_HPP
-#define ENCODER_DRIVER_HPP
+#pragma once
 
 #include "canopen_driver.hpp"
 #include <cstdint>
 #include <thread>
 #include <chrono>
+
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 class EncoderDriver : public CANOpenDriver {
 public:
@@ -41,5 +41,3 @@ private:
 
     std::chrono::steady_clock::time_point last_sample_time_;
 };
-
-#endif // ENCODER_DRIVER_HPP

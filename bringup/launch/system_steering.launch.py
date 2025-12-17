@@ -5,9 +5,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
-default_controller_manager_update_rate = 100
-
+from caddy_ai2_ros2_common.launch_utils import read_update_rate_from_controller_yaml
 
 def generate_launch_description():
 
@@ -24,20 +22,7 @@ def generate_launch_description():
         ]
     )
 
-    # LEER EL YAML DE CONFIGURACIÓN DEL CONTROLADOR
-    context = LaunchContext()
-    resolved_system_steering_config_path = system_steering_config.perform(context)
-    
-    # Leer el contenido del archivo YAML
-    with open(resolved_system_steering_config_path, 'r') as yaml_file:
-        try:
-            yaml_content = yaml.safe_load(yaml_file)
-            print("[DEBUG LAUNCH] YAML Content:", yaml_content) 
-            # Obtener el valor de update_rate o usar 100 como predeterminado
-            update_rate = yaml_content.get("controller_manager", {}).get("ros__parameters", {}).get("update_rate", default_controller_manager_update_rate)
-        except yaml.YAMLError as exc:
-            print(f"[ERROR LAUNCH] Error al cargar el YAML: {exc}")
-            update_rate = default_controller_manager_update_rate
+    update_rate = read_update_rate_from_controller_yaml(system_steering_config)
 
     # Get URDF via xacro - CORREGIDO: añadir "description/"
     system_steering_urdf_content = Command(

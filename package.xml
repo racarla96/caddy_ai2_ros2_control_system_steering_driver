@@ -4,7 +4,7 @@
   <name>caddy_ai2_ros2_control_system_steering_driver</name>
   <version>0.0.1</version>
   <description>ROS2 Control driver for Caddy AI2 steering system with CAN interface</description>
-  <maintainer email="racarla96@gmail.com">Rafael Carbonell Lázaro</maintainer>
+  <maintainer email="racarla1@inf.upv.es">Rafael Carbonell Lázaro</maintainer>
   <license>CC-BY-4.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -13,6 +13,7 @@
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <depend>caddy_ai2_ros2_common</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

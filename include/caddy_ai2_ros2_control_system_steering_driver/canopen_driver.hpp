@@ -1,11 +1,11 @@
-// canopen_driver.hpp
-#ifndef CANOPEN_DRIVER_HPP
-#define CANOPEN_DRIVER_HPP
+#pragma once
 
 #include <linux/can.h>
 #include <cstdint>
 #include <string>
 #include <chrono>
+
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 class SocketCANInterface;
 
@@ -62,5 +62,3 @@ protected:
     std::chrono::steady_clock::time_point last_heartbeat_time_;
     bool communication_ok_;
 };
-
-#endif // CANOPEN_DRIVER_HPP

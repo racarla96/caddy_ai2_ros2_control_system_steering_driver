@@ -1,11 +1,10 @@
-// steering_controller.hpp
-#ifndef STEERING_CONTROLLER_HPP
-#define STEERING_CONTROLLER_HPP
+#pragma once
 
-#include "socket_can_interface.hpp"
 #include "motor_driver.hpp"
 #include "encoder_driver.hpp"
 #include <memory>
+
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 class SteeringController {
 public:
@@ -42,5 +41,3 @@ private:
 
     int32_t commanded_position_;
 };
-
-#endif // STEERING_CONTROLLER_HPP

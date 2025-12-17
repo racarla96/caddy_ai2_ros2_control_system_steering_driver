@@ -1,11 +1,11 @@
-// motor_driver.hpp
-#ifndef MOTOR_DRIVER_HPP
-#define MOTOR_DRIVER_HPP
+#pragma once
 
 #include "canopen_driver.hpp"
 #include <cstdint>
 #include <thread>
 #include <chrono>
+
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 // Estados del motor según CiA 402
 enum class MotorState {
@@ -92,5 +92,3 @@ private:
     std::chrono::steady_clock::time_point last_sdo_read_time_;
     int sdo_read_counter_;
 };
-
-#endif // MOTOR_DRIVER_HPP
