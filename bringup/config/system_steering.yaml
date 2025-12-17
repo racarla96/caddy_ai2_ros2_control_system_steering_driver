@@ -8,7 +8,4 @@ controller_manager:
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-system_steering_controller:
-  ros__parameters:
-    joints:
-      - steering_joint
+    system_steering_controller.joints: ["steering_joint"]
