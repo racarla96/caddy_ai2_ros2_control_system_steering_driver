@@ -386,10 +386,10 @@ bool MotorDriver::setTargetPosition(int32_t position) {
         std::cerr << "[MotorDriver] ERROR sending target position PDO, pos=" << position << std::endl;
     } else {
         // DEBUG: imprime algunas veces
-        static int c = 0;
-        if ((c++ % 50) == 0) {
-            std::cout << "[MotorDriver] Sent target position PDO: " << position << std::endl;
-        }
+        //static int c = 0;
+        //if ((c++ % 50) == 0) {
+        //    std::cout << "[MotorDriver] Sent target position PDO: " << position << std::endl;
+        //}
     }
     return ok;
 }
