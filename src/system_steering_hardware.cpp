@@ -233,7 +233,7 @@ hardware_interface::return_type SystemSteeringHardware::write(
     write_counter_ = 0;
 
     // Convertir comando de radianes a counts
-    int32_t target_counts = static_cast<int32_t>(hw_commands_[0] * counts_per_radian_ + abs_zero_position_);
+    int32_t target_counts = static_cast<int32_t>((hw_commands_[0] * counts_per_radian_ + abs_zero_position_) * (1/gain_inc_to_abs));
     
     // Enviar comando al motor
     steering_controller_->setTargetSteeringPosition(target_counts);
