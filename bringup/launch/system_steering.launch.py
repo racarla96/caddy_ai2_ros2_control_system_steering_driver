@@ -1,5 +1,4 @@
 import yaml
-from launch import LaunchContext
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
@@ -9,10 +8,7 @@ from caddy_ai2_ros2_common.launch_utils import read_update_rate_from_controller_
 
 def generate_launch_description():
 
-    # Declare arguments
-    declared_arguments = []
-
-    # Get controller configuration - CORREGIDO: añadir "bringup/"
+    # Get controller configuration
     system_steering_config = PathJoinSubstitution(
         [
             FindPackageShare("caddy_ai2_ros2_control_system_steering_driver"),
@@ -24,7 +20,7 @@ def generate_launch_description():
 
     update_rate = read_update_rate_from_controller_yaml(system_steering_config)
 
-    # Get URDF via xacro - CORREGIDO: añadir "description/"
+    # Get URDF via xacro
     system_steering_urdf_content = Command(
         [
             PathJoinSubstitution([FindExecutable(name="xacro")]),
@@ -42,41 +38,40 @@ def generate_launch_description():
         ]
     )
 
-    # MOSTRAR EL CONTENIDO DEL COMANDO
-    #context = LaunchContext()
-    #resolved_system_steering_urdf_content = system_steering_urdf_content.perform(context)
-    #print(f"[DEBUG LAUNCH] system_steering_urdf_content: {resolved_system_steering_urdf_content}")
-
     robot_description = {"robot_description": system_steering_urdf_content}
 
-    # ROS2 Control node
+    # ROS2 Control node with namespace
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
+        namespace="steering",
         parameters=[robot_description, system_steering_config],
         output="both",
     )
 
-    # Robot state publisher
+    # Robot state publisher with namespace
     robot_state_pub_node = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
+        namespace="steering",
         output="both",
         parameters=[robot_description],
     )
 
-    # Joint state broadcaster spawner
+    # Joint state broadcaster spawner with namespace
     joint_state_broadcaster_spawner = Node(
         package="controller_manager",
         executable="spawner",
+        namespace="steering",
         arguments=["joint_state_broadcaster"],
         output="screen",
     )
 
-    # Steering controller spawner
+    # Steering controller spawner with namespace
     system_steering_controller_spawner = Node(
         package="controller_manager",
         executable="spawner",
+        namespace="steering",
         arguments=["system_steering_controller"],
         output="screen",
     )
@@ -88,4 +83,4 @@ def generate_launch_description():
         system_steering_controller_spawner,
     ]
 
-    return LaunchDescription(declared_arguments + nodes)
+    return LaunchDescription(nodes)
