@@ -2,6 +2,9 @@
 
 Sistema de control de dirección para ROS2 Control utilizando CANopen sobre SocketCAN.
 
+## TODOs:
+- [ ] Cambiar el código de tipo sistema a tipo actuador
+
 ## 📋 Descripción
 
 Este paquete implementa un hardware interface de ROS2 Control para un sistema de dirección basado en:
