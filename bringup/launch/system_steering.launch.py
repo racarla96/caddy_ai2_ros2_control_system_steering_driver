@@ -43,8 +43,9 @@ def generate_launch_description():
     )
 
     # MOSTRAR EL CONTENIDO DEL COMANDO
-    resolved_system_steering_urdf_content = system_steering_urdf_content.perform(context)
-    print(f"[DEBUG LAUNCH] system_steering_urdf_content: {resolved_system_steering_urdf_content}")
+    #context = LaunchContext()
+    #resolved_system_steering_urdf_content = system_steering_urdf_content.perform(context)
+    #print(f"[DEBUG LAUNCH] system_steering_urdf_content: {resolved_system_steering_urdf_content}")
 
     robot_description = {"robot_description": system_steering_urdf_content}
 
