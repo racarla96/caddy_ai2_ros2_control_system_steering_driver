@@ -74,7 +74,8 @@ private:
   uint8_t encoder_node_id_;
   
   // Conversión de unidades
-  double counts_per_radian_;  // Factor de conversión encoder counts -> radianes
+  double counts_per_radian_ = 2*3.14159/4096;  // Factor de conversión encoder counts -> radianes
+  double abs_zero_position_ = 3109;
 };
 
 }  // namespace caddy_ai2_ros2_control_system_steering_driver

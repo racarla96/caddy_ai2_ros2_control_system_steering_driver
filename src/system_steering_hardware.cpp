@@ -40,8 +40,6 @@ hardware_interface::CallbackReturn SystemSteeringHardware::on_init(
                               info_.hardware_parameters["motor_node_id"] : "1");
   encoder_node_id_ = std::stoi(info_.hardware_parameters.count("encoder_node_id") ? 
                                 info_.hardware_parameters["encoder_node_id"] : "127");
-  counts_per_radian_ = std::stod(info_.hardware_parameters.count("counts_per_radian") ? 
-                                  info_.hardware_parameters["counts_per_radian"] : "100000.0");
 
   // Validar parámetros
   if (hardware_sample_frequency_hz_ <= 0)
@@ -217,7 +215,7 @@ hardware_interface::return_type SystemSteeringHardware::read(
     int32_t position_counts = steering_controller_->getAbsoluteEncoderPosition();
     
     // Convertir a radianes
-    hw_states_[0] = static_cast<double>(position_counts) / counts_per_radian_;
+    hw_states_[0] = static_cast<double>(position_counts - abs_zero_position_) / counts_per_radian_;
   }
 
   return hardware_interface::return_type::OK;
@@ -235,7 +233,7 @@ hardware_interface::return_type SystemSteeringHardware::write(
     write_counter_ = 0;
 
     // Convertir comando de radianes a counts
-    int32_t target_counts = static_cast<int32_t>(hw_commands_[0] * counts_per_radian_);
+    int32_t target_counts = static_cast<int32_t>(hw_commands_[0] * counts_per_radian_ + abs_zero_position_);
     
     // Enviar comando al motor
     steering_controller_->setTargetSteeringPosition(target_counts);
