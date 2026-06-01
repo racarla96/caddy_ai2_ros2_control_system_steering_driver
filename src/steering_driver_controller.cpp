@@ -75,6 +75,12 @@ controller_interface::CallbackReturn SteeringDriverController::on_configure(
     // Publisher: broadcast measured encoder position [rad] to observers
     encoder_pub_ = node->create_publisher<std_msgs::msg::Float64>(
       "~/state", rclcpp::SensorDataQoS());
+
+    // Temporary debug publishers: raw encoder counts
+    abs_encoder_counts_pub_ = node->create_publisher<std_msgs::msg::Float64>(
+      "~/debug/abs_encoder_counts", rclcpp::SensorDataQoS());
+    inc_encoder_counts_pub_ = node->create_publisher<std_msgs::msg::Float64>(
+      "~/debug/inc_encoder_counts", rclcpp::SensorDataQoS());
   }
   catch (const std::exception & e)
   {
@@ -141,6 +147,8 @@ controller_interface::CallbackReturn SteeringDriverController::on_cleanup(
   steering_controller_.reset();
   target_sub_.reset();
   encoder_pub_.reset();
+  abs_encoder_counts_pub_.reset();
+  inc_encoder_counts_pub_.reset();
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -156,13 +164,19 @@ controller_interface::return_type SteeringDriverController::update(
     // Drive the CANopen state machines and read incoming frames
     steering_controller_->step();
 
-    // Read encoder and publish [rad]
-    const int32_t enc_counts = steering_controller_->getAbsoluteEncoderPosition();
-    const double enc_rad = static_cast<double>(enc_counts) / params_.counts_per_radian;
+    // Read absolute encoder and publish [rad]
+    const int32_t abs_counts = steering_controller_->getAbsoluteEncoderPosition();
+    const int32_t inc_counts = steering_controller_->getMotorEncoderPosition();
 
     auto msg = std_msgs::msg::Float64();
-    msg.data = enc_rad;
+    msg.data = static_cast<double>(abs_counts) / params_.counts_per_radian;
     encoder_pub_->publish(msg);
+
+    msg.data = static_cast<double>(abs_counts);
+    abs_encoder_counts_pub_->publish(msg);
+
+    msg.data = static_cast<double>(inc_counts);
+    inc_encoder_counts_pub_->publish(msg);
   }
 
   // --- Write path: send target position command ---

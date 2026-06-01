@@ -50,6 +50,9 @@ protected:
   // ROS2 I/O: target position commands in, encoder position out
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_sub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr encoder_pub_;
+  // Temporary debug publishers: raw encoder counts
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr abs_encoder_counts_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr inc_encoder_counts_pub_;
 
   // RT-safe target storage (written by subscription callback, read in update)
   std::atomic<double> target_position_rad_{0.0};
