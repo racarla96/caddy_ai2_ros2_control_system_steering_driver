@@ -1,0 +1,110 @@
+steering_driver_controller:
+
+  interface_name:
+    {
+      type: string,
+      description: "SocketCAN network interface name (e.g. can0, can_steer_drv)",
+      read_only: true,
+      validation: {
+        not_empty<>: []
+      }
+    }
+
+  controller_manager_frequency_hz:
+    {
+      type: double,
+      default_value: 100.0,
+      description: "Controller manager update frequency in Hz",
+      read_only: true,
+      validation: {
+        gt<>: [0.0]
+      }
+    }
+
+  hardware_sample_frequency_hz:
+    {
+      type: double,
+      default_value: 500.0,
+      description: "CAN bus hardware sampling frequency in Hz",
+      read_only: true,
+      validation: {
+        gt<>: [0.0]
+      }
+    }
+
+  read_multiplicity:
+    {
+      type: int,
+      default_value: 1,
+      description: "Number of controller cycles between encoder reads",
+      read_only: true,
+      validation: {
+        gt<>: [0]
+      }
+    }
+
+  write_multiplicity:
+    {
+      type: int,
+      default_value: 10,
+      description: "Number of controller cycles between motor position writes",
+      read_only: true,
+      validation: {
+        gt<>: [0]
+      }
+    }
+
+  read_offset:
+    {
+      type: int,
+      default_value: 0,
+      description: "Phase offset in controller cycles applied to the read counter at startup",
+      read_only: true,
+      validation: {
+        gt<>: [-1]
+      }
+    }
+
+  write_offset:
+    {
+      type: int,
+      default_value: 1,
+      description: "Phase offset in controller cycles applied to the write counter at startup",
+      read_only: true,
+      validation: {
+        gt<>: [-1]
+      }
+    }
+
+  motor_node_id:
+    {
+      type: int,
+      default_value: 1,
+      description: "CANopen node ID of the motor drive (1–127)",
+      read_only: true,
+      validation: {
+        bounds<>: [1, 127]
+      }
+    }
+
+  encoder_node_id:
+    {
+      type: int,
+      default_value: 127,
+      description: "CANopen node ID of the absolute encoder (1–127)",
+      read_only: true,
+      validation: {
+        bounds<>: [1, 127]
+      }
+    }
+
+  counts_per_radian:
+    {
+      type: double,
+      default_value: 1.0,
+      description: "Absolute encoder counts per radian for position conversion",
+      read_only: true,
+      validation: {
+        gt<>: [0.0]
+      }
+    }

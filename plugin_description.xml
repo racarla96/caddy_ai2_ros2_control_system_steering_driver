@@ -1,0 +1,12 @@
+<library path="caddy_ai2_ros2_control_system_steering_driver">
+  <class
+    name="caddy_ai2_ros2_control_system_steering_driver/SteeringDriverController"
+    type="caddy_ai2_ros2_control_system_steering_driver::SteeringDriverController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Controller that drives the Caddy AI2 steering system via CAN/CANopen.
+      Receives target steering position [rad] on ~/reference and publishes
+      the measured absolute encoder position [rad] on ~/state.
+    </description>
+  </class>
+</library>
