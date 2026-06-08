@@ -1,43 +1,41 @@
 #pragma once
 
-#include "canopen_driver.hpp"
+#include "caddy_ai2_ros2_control_system_steering_driver/canopen_driver.hpp"
 #include <cstdint>
-#include <thread>
-#include <chrono>
 
-#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
-
-class EncoderDriver : public CANOpenDriver {
+// ============================================================================
+// EncoderDriver — encoder absoluto CAN externo (EpcEncoder)
+//
+// Usa el mapping ESTÁNDAR de CANopen (COB_ENC_TPDO1_BASE = 0x180 + node_id),
+// a diferencia del motor AMC que usa COB-IDs propietarios.
+//
+// configure() es bloqueante. El resto es no bloqueante.
+// ============================================================================
+class EncoderDriver : public CANopenDriver
+{
 public:
-    EncoderDriver(uint8_t node_id, const std::string& name = "Encoder");
-    virtual ~EncoderDriver() = default;
+    explicit EncoderDriver(SocketCANInterface& can, uint8_t node_id);
 
-    // Implementación de métodos virtuales
-    bool initialize(SocketCANInterface* can_interface) override;
-    bool startOperational() override;
-    void update() override;
-    void processCANFrame(const struct can_frame& frame) override;
+    // Secuencia de arranque: NMT reset → TPDO config → NodeGuard → NMT START.
+    // Bloqueante (contiene sleeps).
+    bool configure() override;
 
-    // Getters
-    int32_t getAbsolutePosition() const { return absolute_position_; }
-    int32_t getFilteredPosition() const { return filtered_position_; }
+    // Posición absoluta cruda en counts (int32, little-endian del TPDO1)
+    int32_t get_raw_position() const { return raw_position_; }
 
-// Nuevos métodos públicos
-    bool isValid() const { return encoder_ok_; }
-    int32_t getPositionRaw() const { return absolute_position_; }
-    int32_t getPositionFiltered() const { return filtered_position_; }
+    // True cuando se ha recibido al menos un TPDO1 válido (≥ 4 bytes)
+    bool is_valid() const { return valid_; }
 
 private:
-    bool configureTPDOs();
-    bool configureNodeGuard();
+    // ── Configuración (solo desde configure()) ───────────────────────────────
+    bool configure_tpdo();       // SDO 0x1800:01 (COB-ID) y 0x1800:02 (trans type)
+    bool configure_nodeguard();  // SDO 0x100C (guard_time) y 0x100D (life_factor)
 
-    void processTPDO1(const struct can_frame& frame); // posición absoluta 1
-    void processTPDO2(const struct can_frame& frame); // posición absoluta 2 / redundante
-    void processNodeGuardResponse(const struct can_frame& frame);
+    // ── Procesado de frames ──────────────────────────────────────────────────
+    void process_frame(const can_frame& frame) override;
+    void process_tpdo1(const can_frame& frame);  // posición absoluta 4 bytes LE
 
-    int32_t absolute_position_;
-    int32_t filtered_position_;
-    bool encoder_ok_;
-
-    std::chrono::steady_clock::time_point last_sample_time_;
+    // ── Estado interno ───────────────────────────────────────────────────────
+    int32_t raw_position_;  // último valor recibido del encoder
+    bool    valid_;         // false hasta recibir el primer TPDO1 válido
 };

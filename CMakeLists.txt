@@ -16,7 +16,6 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   pluginlib
   rclcpp
   rclcpp_lifecycle
-  caddy_ai2_ros2_common
 )
 
 find_package(ament_cmake REQUIRED)
@@ -28,21 +27,17 @@ endforeach()
 add_library(
   ${PROJECT_NAME}
   SHARED
-  src/system_steering_hardware.cpp
+  src/socket_can_interface.cpp
   src/canopen_driver.cpp
   src/motor_driver.cpp
   src/encoder_driver.cpp
   src/steering_controller.cpp
+  src/system_steering_hardware.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
-)
-
-# Add caddy_ai2_ros2_common headers
-target_include_directories(${PROJECT_NAME} PUBLIC
-  ${caddy_ai2_ros2_common_INCLUDE_DIRS}
 )
 
 ament_target_dependencies(
@@ -79,6 +74,36 @@ install(TARGETS ${PROJECT_NAME}
 install(PROGRAMS
   scripts/setup_can_steer_drv.sh 
   scripts/setup_vcan_steer_drv.sh
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+## Tests standalone — sin dependencias de ROS
+set(TEST_SRCS
+  src/socket_can_interface.cpp
+  src/canopen_driver.cpp
+  src/motor_driver.cpp
+  src/encoder_driver.cpp
+  src/steering_controller.cpp
+)
+
+foreach(TEST_NAME test_standalone test_passive test_sinusoidal test_calibration)
+  if(TEST_NAME STREQUAL "test_passive" OR TEST_NAME STREQUAL "test_calibration")
+    add_executable(${TEST_NAME}
+      test/${TEST_NAME}.cpp
+      src/socket_can_interface.cpp
+    )
+  else()
+    add_executable(${TEST_NAME}
+      test/${TEST_NAME}.cpp
+      ${TEST_SRCS}
+    )
+  endif()
+  target_include_directories(${TEST_NAME} PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+  )
+endforeach()
+
+install(TARGETS test_standalone test_passive test_sinusoidal test_calibration
   DESTINATION lib/${PROJECT_NAME}
 )
 

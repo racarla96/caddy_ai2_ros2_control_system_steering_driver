@@ -1,46 +1,45 @@
+import os
+import subprocess
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-from caddy_ai2_ros2_common.launch_utils import read_update_rate_from_controller_yaml
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+_PKG = "caddy_ai2_ros2_control_system_steering_driver"
+
+
+def _pkg_share() -> str:
+    return get_package_share_directory(_PKG)
+
+
+def _read_update_rate() -> int:
+    config_path = os.path.join(_pkg_share(), "bringup", "config", "system_steering.yaml")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    return int(cfg["steering"]["controller_manager"]["ros__parameters"]["update_rate"])
+
 
 def generate_launch_description():
 
-    # Get controller configuration
-    system_steering_config = PathJoinSubstitution(
-        [
-            FindPackageShare("caddy_ai2_ros2_control_system_steering_driver"),
-            "bringup",
-            "config",
-            "system_steering.yaml",
-        ]
+    pkg_share = _pkg_share()
+    update_rate = _read_update_rate()
+
+    system_steering_config = os.path.join(
+        pkg_share, "bringup", "config", "system_steering.yaml"
     )
 
-    update_rate = read_update_rate_from_controller_yaml(system_steering_config)
-
-    # Get URDF via xacro
-    system_steering_urdf_content = Command(
-        [
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
-            " ",
-            PathJoinSubstitution(
-                [
-                    FindPackageShare("caddy_ai2_ros2_control_system_steering_driver"), 
-                    "description",
-                    "urdf", 
-                    "system_steering.urdf.xacro"
-                ]
-            ),
-            " ",
-            f"update_rate:={update_rate}",
-        ]
+    xacro_path = os.path.join(
+        pkg_share, "description", "urdf", "system_steering.urdf.xacro"
     )
 
-    robot_description = {"robot_description": system_steering_urdf_content}
+    result = subprocess.run(
+        ["xacro", xacro_path, f"update_rate:={update_rate}"],
+        capture_output=True, text=True, check=True,
+    )
+    robot_description = {"robot_description": ParameterValue(result.stdout, value_type=str)}
 
-    # ROS2 Control node with namespace
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
@@ -49,7 +48,6 @@ def generate_launch_description():
         output="both",
     )
 
-    # Robot state publisher with namespace
     robot_state_pub_node = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
@@ -58,7 +56,6 @@ def generate_launch_description():
         parameters=[robot_description],
     )
 
-    # Joint state broadcaster spawner with namespace
     joint_state_broadcaster_spawner = Node(
         package="controller_manager",
         executable="spawner",
@@ -67,7 +64,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    # Steering controller spawner with namespace
     system_steering_controller_spawner = Node(
         package="controller_manager",
         executable="spawner",
@@ -76,11 +72,9 @@ def generate_launch_description():
         output="screen",
     )
 
-    nodes = [
+    return LaunchDescription([
         control_node,
         robot_state_pub_node,
         joint_state_broadcaster_spawner,
         system_steering_controller_spawner,
-    ]
-
-    return LaunchDescription(nodes)
+    ])

@@ -6,18 +6,69 @@
     <ros2_control name="steering_system" type="system">
       <hardware>
         <plugin>caddy_ai2_ros2_control_system_steering_driver/SystemSteeringHardware</plugin>
-        <param name="interface_name">can_steer_drv</param>
+
+        <!-- ── CAN ───────────────────────────────────────────────────────── -->
+        <param name="can_interface_name">can_steer_drv</param>
+        <param name="motor_node_id">1</param>
+
+        <!-- ── Modo de feedback ──────────────────────────────────────────── -->
+        <!-- 0 = potenciómetro (entradas analógicas del DZCANTE vía SDO 0x201A) -->
+        <!-- 1 = encoder EPC (nodo CANopen externo)                           -->
+        <param name="feedback_mode">0</param>
+        <!-- Nodo CANopen del encoder EPC (ignorado si feedback_mode=0):      -->
+        <param name="encoder_node_id">127</param>
+        <!-- Canal analógico del potenciómetro, 0-based (0=AI1,1=AI2,2=AI3). -->
+        <!-- potentiometer_analog_input en rbcar config es el índice 0-based. -->
+        <param name="analog_input_pin">0</param>
+
+        <!-- ── Calibración del actuador (ángulo → counts motor) ─────────── -->
+        <!-- Counts del encoder interno del motor en cada límite físico.      -->
+        <!-- actuator_encoder_left  → límite izquierdo  (ángulo = +range)    -->
+        <!-- actuator_encoder_right → límite derecho    (ángulo = −range)    -->
+        <param name="actuator_encoder_left">97750</param>
+        <param name="actuator_encoder_right">-99000</param>
+
+        <!-- ── Calibración del encoder EPC (feedback_mode=1) ────────────── -->
+        <!-- Counts del encoder absoluto externo en cada límite físico.      -->
+        <!-- reading_encoder_left  → límite izquierdo  (ángulo = +range)     -->
+        <!-- reading_encoder_right → límite derecho    (ángulo = −range)     -->
+        <param name="reading_encoder_left">880</param>
+        <param name="reading_encoder_right">4520</param>
+        <param name="reading_encoder_zero_position">2650</param>
+        <param name="reading_encoder_resolution">4096</param>
+
+        <!-- ── Calibración del potenciómetro (feedback_mode=0) ──────────── -->
+        <!-- mV del potenciómetro en cada límite físico y en posición cero.  -->
+        <!-- Ajustar tras una calibración manual con test_passive.           -->
+        <!-- potentiometer_left_mv  → límite izquierdo  (ángulo = +range)    -->
+        <!-- potentiometer_right_mv → límite derecho    (ángulo = −range)    -->
+        <!-- potentiometer_zero_mv  → posición recta (ángulo = 0 rad)        -->
+        <param name="potentiometer_left_mv">434</param>
+        <param name="potentiometer_right_mv">3959</param>
+        <!-- Si se omite, se usa (left+right)/2 como valor por defecto       -->
+        <param name="potentiometer_zero_mv">2243</param>
+
+        <!-- ── Rango de dirección ────────────────────────────────────────── -->
+        <!-- Ángulo máximo alcanzable en cada sentido (rad)                  -->
+        <param name="steering_angle_range">0.5747</param>
+
+        <!-- ── Temporización ─────────────────────────────────────────────── -->
+        <!-- controller_manager_frequency_hz: frecuencia del CM (Hz)         -->
+        <!-- hardware_sample_frequency_hz:    frecuencia de muestreo CAN     -->
+        <!-- read_multiplicity:  ejecutar read()  cada N ciclos CM           -->
+        <!-- write_multiplicity: ejecutar write() cada N ciclos CM           -->
+        <!-- read_offset / write_offset: desfase en ciclos al activar        -->
         <param name="controller_manager_frequency_hz">${update_rate}</param>
         <param name="hardware_sample_frequency_hz">500</param>
         <param name="read_multiplicity">1</param>
         <param name="write_multiplicity">10</param>
         <param name="read_offset">0</param>
         <param name="write_offset">1</param>
+
       </hardware>
       <joint name="steering_joint">
         <command_interface name="position"/>
         <state_interface name="position"/>
-        <!-- <state_interface name="velocity"/> -->
       </joint>
     </ros2_control>
 

@@ -1,11 +1,14 @@
-controller_manager:
-  ros__parameters:
-    update_rate: 500  # Hz
+steering:
+  controller_manager:
+    ros__parameters:
+      update_rate: 500  # Hz
 
-    system_steering_controller:
-      type: position_controllers/JointGroupPositionController
+      system_steering_controller:
+        type: position_controllers/JointGroupPositionController
 
-    joint_state_broadcaster:
-      type: joint_state_broadcaster/JointStateBroadcaster
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
 
-    system_steering_controller.joints: ["steering_joint"]
+  system_steering_controller:
+    ros__parameters:
+      joints: ["steering_joint"]

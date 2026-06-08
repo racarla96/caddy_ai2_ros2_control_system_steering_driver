@@ -53,7 +53,7 @@ def generate_launch_description():
                 ]
             ),
             " ",
-            f"controller_manager_frequency_hz:={update_rate}",
+            f"update_rate:={update_rate}",
         ]
     )
 

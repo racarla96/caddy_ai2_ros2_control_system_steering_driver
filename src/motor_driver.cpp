@@ -1,427 +1,377 @@
 #include "caddy_ai2_ros2_control_system_steering_driver/motor_driver.hpp"
-#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
-#include <iostream>
-#include <cstring>
-#include <thread>
+
 #include <chrono>
+#include <cstring>
+#include <iostream>
+#include <thread>
 
-// Máscaras para decodificar el Status Word (CiA 402)
-#define SW_READY_TO_SWITCH_ON   0x01
-#define SW_SWITCHED_ON          0x02
-#define SW_OPERATION_ENABLED    0x04
-#define SW_FAULT                0x08
-#define SW_VOLTAGE_ENABLED      0x10
-#define SW_QUICK_STOP           0x20
-#define SW_SWITCH_ON_DISABLED   0x40
-#define SW_WARNING              0x80
+using namespace dzcante020l080;
 
-MotorDriver::MotorDriver(uint8_t node_id, const std::string& name)
-    : CANOpenDriver(node_id, name)
-    , motor_state_(MotorState::NOT_READY_TO_SWITCH_ON)
+// ── Constructor ──────────────────────────────────────────────────────────────
+
+MotorDriver::MotorDriver(SocketCANInterface& can, uint8_t node_id)
+    : CANopenDriver(can, node_id)
+    , drive_state_(DriveState::UNKNOWN)
+    , desired_state_(DriveState::OPERATION_ENABLED)
     , status_word_(0)
-    , control_word_(0)
-    , target_position_(0)
     , actual_position_(0)
-    , actual_velocity_(0)
-    , actual_current_(0)
-    , dc_bus_voltage_(0)
-    , sdo_read_counter_(0) {
-}
+    , ds402_interval_(0.0)
+    , analog_inputs_mv_{}
+    , analog_input_valid_(false)
+{}
 
-bool MotorDriver::initialize(SocketCANInterface* can_interface) {
-    can_interface_ = can_interface;
-    
-    std::cout << "[" << name_ << "] Iniciando configuración..." << std::endl;
+// ── Lifecycle ────────────────────────────────────────────────────────────────
 
-    // Reset de comunicación
-    if (!sendNMT(0x82)) {  // NMT_RESET_COMMUNICATION
-        std::cerr << "[" << name_ << "] Error enviando RESET_COMMUNICATION" << std::endl;
+bool MotorDriver::configure()
+{
+    std::cout << "[MotorDriver:" << static_cast<int>(node_id_)
+              << "] Iniciando configuración...\n";
+
+    // 1. Reset de comunicación → el drive vuelve al estado por defecto
+    if (!send_nmt(NMT_RESET_COMMUNICATION)) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT RESET_COMM\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_RESET_MS));
 
-    // Entrar en Pre-Operational
-    if (!sendNMT(0x80)) {  // NMT_ENTER_PRE_OPERATIONAL
-        std::cerr << "[" << name_ << "] Error enviando PRE_OPERATIONAL" << std::endl;
+    // 2. Entrar en PRE_OPERATIONAL para configurar PDOs vía SDO
+    if (!send_nmt(NMT_ENTER_PRE_OPERATIONAL)) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT PRE_OP\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PREOP_MS));
+    nmt_state_ = NmtState::PRE_OPERATIONAL;
 
-    nmt_state_ = NMTState::PRE_OPERATIONAL;
-
-    // Configurar PDOs
-    if (!configureRPDOs()) {
-        std::cerr << "[" << name_ << "] Error configurando RPDOs" << std::endl;
-        return false;
-    }
-
-    if (!configureTPDOs()) {
-        std::cerr << "[" << name_ << "] Error configurando TPDOs" << std::endl;
-        return false;
-    }
-
-    // Configurar Node Guard
-    if (!configureNodeGuard()) {
-        std::cerr << "[" << name_ << "] Error configurando Node Guard" << std::endl;
+    // 3. Configurar PDOs (COB-IDs y tipos de transmisión)
+    if (!configure_pdos()) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error configurando PDOs\n";
         return false;
     }
 
-    // Configurar modo de operación
-    if (!configureDriveMode()) {
-        std::cerr << "[" << name_ << "] Error configurando modo de operación" << std::endl;
+    // 4. Configurar NodeGuard
+    if (!configure_nodeguard()) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error configurando NodeGuard\n";
         return false;
     }
 
-    std::cout << "[" << name_ << "] Configuración completada" << std::endl;
+    // 5. Configurar modo de operación (Profile Position)
+    if (!configure_mode()) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error configurando modo posición\n";
+        return false;
+    }
+
+    // 6+7. Secuencia ControlWord + NMT START → OPERATIONAL
+    if (!startup_sequence()) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error en secuencia de arranque\n";
+        return false;
+    }
+
+    std::cout << "[MotorDriver:" << static_cast<int>(node_id_)
+              << "] Configuración completada. NMT=OPERATIONAL\n";
     return true;
 }
 
-bool MotorDriver::configureRPDOs() {
-    // Configuración de RPDO 1 (Control Word) - COB-ID 0x200 + node_id
-    uint32_t rpdo1_cob_id = 0x200 + node_id_;
-    if (!sendSDO(0x1400, 0x01, (uint8_t*)&rpdo1_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+void MotorDriver::shutdown()
+{
+    // Envío inmediato de QUICK_STOP antes de que el socket se cierre
+    send_control_word_pdo(CW_QUICK_STOP);
+}
 
-    // Configuración de RPDO 21 (Target Position) - COB-ID 0x230 + node_id
-    uint32_t rpdo21_cob_id = 0x230 + node_id_;
-    if (!sendSDO(0x1414, 0x01, (uint8_t*)&rpdo21_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+// ── Métodos cíclicos ─────────────────────────────────────────────────────────
 
-    // Configuración de RPDO 22 (Target Velocity) - COB-ID 0x240 + node_id
-    uint32_t rpdo22_cob_id = 0x240 + node_id_;
-    if (!sendSDO(0x1415, 0x01, (uint8_t*)&rpdo22_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+void MotorDriver::update(double dt)
+{
+    CANopenDriver::update(dt);  // watchdog NMT + NodeGuard RTR periódico
+    tick_ds402(dt);             // transiciones de estado DS402 (solo si OPERATIONAL)
+}
+
+// ── API pública ──────────────────────────────────────────────────────────────
+
+void MotorDriver::poll_analog_input(uint8_t pin)
+{
+    if (pin >= 3) return;
+    // SDO upload request → 0x201A:subindex (1-based)
+    send_sdo_read(SDO_IDX_ANALOG_INPUT, static_cast<uint8_t>(pin + 1));
+}
+
+void MotorDriver::set_target_position(int32_t counts)
+{
+    // RPDO21 — ASYNC: el drive acepta la posición inmediatamente, sin esperar SYNC
+    const uint8_t data[4] = {
+        static_cast<uint8_t>(counts & 0xFF),
+        static_cast<uint8_t>((counts >>  8) & 0xFF),
+        static_cast<uint8_t>((counts >> 16) & 0xFF),
+        static_cast<uint8_t>((counts >> 24) & 0xFF)
+    };
+    send_pdo(static_cast<uint16_t>(COB_RPDO21_BASE + node_id_), data, 4);
+}
+
+void MotorDriver::request_state(DriveState desired)
+{
+    desired_state_ = desired;
+}
+
+// ── Configuración (bloqueante, solo en configure()) ──────────────────────────
+
+bool MotorDriver::configure_pdos()
+{
+    // RPDO1 — ControlWord (master→drive, ASYNC)
+    // COB-ID: 0x180 + node_id  (AMC propietario — NO es el 0x200 estándar)
+    if (!send_sdo_write(SDO_IDX_RPDO1_COMM, SDO_SUB_PDO_COB_ID,
+                        COB_RPDO1_BASE + node_id_, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    if (!send_sdo_write(SDO_IDX_RPDO1_COMM, SDO_SUB_PDO_TRANSMISSION_TYPE,
+                        RPDO_TRANSMISSION_TYPE_ASYNC, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    // RPDO21 — TargetPosition (master→drive, ASYNC)
+    // COB-ID: 0x280 + node_id  (AMC propietario — NO es el 0x300/0x400 estándar)
+    if (!send_sdo_write(SDO_IDX_RPDO21_COMM, SDO_SUB_PDO_COB_ID,
+                        COB_RPDO21_BASE + node_id_, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    if (!send_sdo_write(SDO_IDX_RPDO21_COMM, SDO_SUB_PDO_TRANSMISSION_TYPE,
+                        RPDO_TRANSMISSION_TYPE_ASYNC, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    // TPDO1 — StatusWord (drive→master, cada 10 SYNCs)
+    // COB-ID: 0x4A0 + node_id  (AMC propietario — NO es el 0x180 estándar)
+    if (!send_sdo_write(SDO_IDX_TPDO1_COMM, SDO_SUB_PDO_COB_ID,
+                        COB_TPDO1_BASE + node_id_, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    if (!send_sdo_write(SDO_IDX_TPDO1_COMM, SDO_SUB_PDO_TRANSMISSION_TYPE,
+                        TPDO1_TRANSMISSION_TYPE, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    // TPDO21 — ActualPosition (drive→master, cada SYNC)
+    // COB-ID: 0x400 + node_id  (AMC propietario — NO es el 0x280 estándar)
+    if (!send_sdo_write(SDO_IDX_TPDO21_COMM, SDO_SUB_PDO_COB_ID,
+                        COB_TPDO21_BASE + node_id_, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
+    if (!send_sdo_write(SDO_IDX_TPDO21_COMM, SDO_SUB_PDO_TRANSMISSION_TYPE,
+                        TPDO21_TRANSMISSION_TYPE, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
     return true;
 }
 
-bool MotorDriver::configureTPDOs() {
-    // Configuración de TPDO 1 (Status Word) - COB-ID 0x180 + node_id
-    uint32_t tpdo1_cob_id = 0x180 + node_id_;
-    if (!sendSDO(0x1800, 0x01, (uint8_t*)&tpdo1_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+bool MotorDriver::configure_nodeguard()
+{
+    // Guard time en milisegundos: el drive produce un heartbeat cada guard_time ms
+    if (!send_sdo_write(SDO_IDX_GUARD_TIME, SDO_SUB_GUARD_TIME,
+                        NODEGUARD_GUARD_TIME_MS, 2)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
-    // Configuración de TPDO 21 (Actual Position) - COB-ID 0x290 + node_id
-    uint32_t tpdo21_cob_id = 0x290 + node_id_;
-    if (!sendSDO(0x1814, 0x01, (uint8_t*)&tpdo21_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Configuración de TPDO 22 (Actual Velocity) - COB-ID 0x2A0 + node_id
-    uint32_t tpdo22_cob_id = 0x2A0 + node_id_;
-    if (!sendSDO(0x1815, 0x01, (uint8_t*)&tpdo22_cob_id, 4, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Life time factor: timeout = guard_time * life_factor ms
+    if (!send_sdo_write(SDO_IDX_LIFE_FACTOR, SDO_SUB_LIFE_FACTOR,
+                        NODEGUARD_LIFE_FACTOR, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
     return true;
 }
 
-bool MotorDriver::configureNodeGuard() {
-    // Guard Time (ms)
-    uint16_t guard_time = 200;  // 200ms
-    if (!sendSDO(0x100C, 0x00, (uint8_t*)&guard_time, 2, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Life Time Factor
-    uint8_t life_time_factor = 15;
-    if (!sendSDO(0x100D, 0x00, &life_time_factor, 1, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
+bool MotorDriver::configure_mode()
+{
+    // Modo de operación: 0x01 = Profile Position Mode
+    if (!send_sdo_write(SDO_IDX_MODES_OF_OP, SDO_SUB_MODES_OF_OP,
+                        DRIVE_MODE_POSITION, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
     return true;
 }
 
-bool MotorDriver::configureDriveMode() {
-    // Configurar modo Profile Position (0x01)
-    uint8_t mode = 0x01;
-    if (!sendSDO(0x6060, 0x00, &mode, 1, true)) {
+bool MotorDriver::startup_sequence()
+{
+    // Secuencia de ControlWords vía SDO (drive en PRE_OPERATIONAL)
+    // Lleva al drive desde SWITCH_ON_DISABLED hasta OPERATION_ENABLED antes
+    // de pasar a OPERATIONAL, evitando que el drive entre en OPERATIONAL
+    // sin un estado de potencia definido.
+
+    send_control_word_sdo(CW_DISABLE_VOLTAGE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_SDO_MS));
+
+    send_control_word_sdo(CW_SHUTDOWN);
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_SDO_MS));
+
+    send_control_word_sdo(CW_SWITCH_ON);
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_SDO_MS));
+
+    send_control_word_sdo(CW_ENABLE_OP);
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_SDO_MS));
+
+    // NMT START: el drive pasa a OPERATIONAL y comienza a enviar TPDOs síncronos
+    if (!send_nmt(NMT_START_REMOTE_NODE)) {
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT START\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+    // Estado optimista: el watchdog detectará si el drive no confirma
+    nmt_state_ = NmtState::OPERATIONAL;
+    reset_watchdog();  // inicia el contador de 2 s para recibir el primer heartbeat
     return true;
 }
 
-// --- NUEVO: mandar ControlWord por SDO (para secuencia de arranque) ---
-bool MotorDriver::sendControlWordSDO(uint16_t control_word) {
-    control_word_ = control_word;
+// ── Máquina de estados DS402 ─────────────────────────────────────────────────
 
-    uint8_t data[2];
-    data[0] = control_word & 0xFF;
-    data[1] = (control_word >> 8) & 0xFF;
+void MotorDriver::tick_ds402(double dt)
+{
+    if (nmt_state_ != NmtState::OPERATIONAL) return;
 
-    std::cout << "[" << name_ << "] Enviando ControlWord por SDO = 0x"
-              << std::hex << control_word << std::dec << std::endl;
+    ds402_interval_ += dt;
+    if (ds402_interval_ < DS402_MIN_INTERVAL_S) return;
+    ds402_interval_ = 0.0;
 
-    // 0x6040: ControlWord, subíndice 0x00
-    return sendSDO(0x6040, 0x00, data, 2, true);
-}
-
-bool MotorDriver::startOperational() {
-    std::cout << "[" << name_ << "] Iniciando secuencia de arranque del motor..." << std::endl;
-
-    // Secuencia de power-up del motor por SDO (en PRE-OPERATIONAL), como en el driver original
-
-    // 1. Disable Voltage (opcional, dejar a 0)
-    if (!sendControlWordSDO(static_cast<uint16_t>(MotorCommand::DISABLE_VOLTAGE))) {
-        std::cerr << "[" << name_ << "] Error enviando DISABLE_VOLTAGE (SDO)" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // 2. Shutdown
-    if (!sendControlWordSDO(static_cast<uint16_t>(MotorCommand::SHUTDOWN))) {
-        std::cerr << "[" << name_ << "] Error enviando SHUTDOWN (SDO)" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // 3. Switch On
-    if (!sendControlWordSDO(static_cast<uint16_t>(MotorCommand::SWITCH_ON))) {
-        std::cerr << "[" << name_ << "] Error enviando SWITCH_ON (SDO)" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // 4. Enable Operation
-    if (!sendControlWordSDO(static_cast<uint16_t>(MotorCommand::ENABLE_OPERATION))) {
-        std::cerr << "[" << name_ << "] Error enviando ENABLE_OPERATION (SDO)" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Ahora sí, cambiar a estado OPERATIONAL
-    if (!sendNMT(0x01)) {  // NMT_START_REMOTE_NODE
-        std::cerr << "[" << name_ << "] Error enviando START" << std::endl;
-        return false;
+    // Recuperación de fallo antes de cualquier transición
+    if (drive_state_ == DriveState::FAULT) {
+        send_control_word_pdo(CW_FAULT_RESET);
+        return;
     }
 
-    nmt_state_ = NMTState::OPERATIONAL;
-    resetTimeout(last_nodeguard_time_);
-    resetTimeout(last_sdo_read_time_);
-
-    std::cout << "[" << name_ << "] Motor en estado OPERATIONAL" << std::endl;
-    return true;
-}
-
-void MotorDriver::update() {
-    static int sync_counter = 0;
-    static auto last_print = std::chrono::steady_clock::now();
-
-    if (!isOperational()) return;
-
-    // Actualizar estado del motor basado en status word
-    updateMotorState();
-
-    // NodeGuard a 5 Hz
-    if (checkTimeout(last_nodeguard_time_, 200)) {
-        sendNodeGuard();
-        resetTimeout(last_nodeguard_time_);
-    }
-
-    // SDO reads a 5 Hz
-    if (checkTimeout(last_sdo_read_time_, 200)) {
-        // ... (rotación SDO)
-        sdo_read_counter_++;
-        resetTimeout(last_sdo_read_time_);
-    }
-
-    // DEBUG: medir frecuencia real de llamadas a update() (debería ~50 Hz)
-    sync_counter++;
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_print).count();
-    if (elapsed >= 1) {
-        std::cout << "[MotorDriver] update() calls per second: " << sync_counter << std::endl;
-        sync_counter = 0;
-        last_print = now;
+    if (desired_state_ == DriveState::OPERATION_ENABLED) {
+        switch (drive_state_) {
+            case DriveState::SWITCH_ON_DISABLED:
+                // → READY_TO_SWITCH_ON
+                send_control_word_pdo(CW_SHUTDOWN);
+                break;
+            case DriveState::READY_TO_SWITCH_ON:
+                // → OPERATION_DISABLED (Switched On)
+                send_control_word_pdo(CW_SWITCH_ON);
+                break;
+            case DriveState::OPERATION_DISABLED:
+                // → OPERATION_ENABLED
+                send_control_word_pdo(CW_ENABLE_OP);
+                break;
+            case DriveState::OPERATION_ENABLED:
+                // Mantener estado enviando ENABLE_OP periódicamente
+                send_control_word_pdo(CW_ENABLE_OP);
+                break;
+            case DriveState::QUICK_STOP:
+                // Salir de QUICK_STOP volviendo a SWITCH_ON_DISABLED
+                send_control_word_pdo(CW_DISABLE_VOLTAGE);
+                break;
+            default:
+                // UNKNOWN: esperando el primer StatusWord del TPDO1
+                break;
+        }
+    } else if (desired_state_ == DriveState::QUICK_STOP) {
+        send_control_word_pdo(CW_QUICK_STOP);
     }
 }
 
-void MotorDriver::processCANFrame(const struct can_frame& frame) {
-    uint32_t cob_id = frame.can_id;
-    uint32_t id = static_cast<uint32_t>(node_id_);
+// ── Procesado de frames ──────────────────────────────────────────────────────
 
-    // TPDO 1: Status Word (0x180 + node_id)
-    if (cob_id == (0x180 + id)) {
-        processTPDO1(frame);
-    }
-    // TPDO 21: Actual Position (0x290 + node_id)
-    else if (cob_id == (0x290 + id)) {
-        processTPDO21(frame);
-    }
-    // TPDO 22: Actual Velocity (0x2A0 + node_id)
-    else if (cob_id == (0x2A0 + id)) {
-        processTPDO22(frame);
-    }
-    // SDO Response (0x580 + node_id)
-    else if (cob_id == (0x580 + id)) {
-        processSDOResponse(frame);
-    }
-    // Node Guard Response (0x700 + node_id)
-    else if (cob_id == (0x700 + id)) {
-        processNodeGuardResponse(frame);
-    }
-}
+void MotorDriver::process_frame(const can_frame& frame)
+{
+    // Eliminar el RTR flag para la comparación de COB-ID
+    const uint32_t bare_id = frame.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
+    const uint32_t nid = node_id_;
 
-void MotorDriver::processTPDO1(const struct can_frame& frame) {
-    if (frame.can_dlc >= 2) {
-        uint16_t new_sw = frame.data[0] | (frame.data[1] << 8);
-
-        if (new_sw != status_word_) {
-            status_word_ = new_sw;
-
-            std::cout << "[MotorDriver] StatusWord = 0x"
-                      << std::hex << status_word_ << std::dec << " (";
-
-            if (status_word_ & SW_READY_TO_SWITCH_ON)   std::cout << "RDY ";
-            if (status_word_ & SW_SWITCHED_ON)          std::cout << "SWO ";
-            if (status_word_ & SW_OPERATION_ENABLED)    std::cout << "OPE ";
-            if (status_word_ & SW_FAULT)                std::cout << "FLT ";
-            if (status_word_ & SW_VOLTAGE_ENABLED)      std::cout << "VEN ";
-            if (status_word_ & SW_QUICK_STOP)           std::cout << "QST ";
-            if (status_word_ & SW_SWITCH_ON_DISABLED)   std::cout << "SWOD ";
-            if (status_word_ & SW_WARNING)              std::cout << "WRN ";
-
-            std::cout << ")" << std::endl;
+    if (bare_id == (COB_TPDO1_BASE + nid)) {
+        process_tpdo1(frame);
+    } else if (bare_id == (COB_TPDO21_BASE + nid)) {
+        process_tpdo21(frame);
+    } else if (bare_id == (COB_SDO_RESPONSE_BASE + nid)) {
+        process_sdo_response(frame);
+    } else if (bare_id == (COB_NODEGUARD_BASE + nid)) {
+        // Solo procesar la respuesta del drive (sin RTR flag), no el eco de nuestra RTR
+        if (!(frame.can_id & CAN_RTR_FLAG) && frame.can_dlc >= 1) {
+            process_nmt_heartbeat(frame.data[0]);
         }
     }
 }
 
-void MotorDriver::processTPDO21(const struct can_frame& frame) {
-    if (frame.can_dlc >= 4) {
-        actual_position_ = frame.data[0] | (frame.data[1] << 8) | 
-                          (frame.data[2] << 16) | (frame.data[3] << 24);
-    }
+void MotorDriver::process_tpdo1(const can_frame& frame)
+{
+    if (frame.can_dlc < 2) return;
+    status_word_ = static_cast<uint16_t>(frame.data[0]) |
+                   (static_cast<uint16_t>(frame.data[1]) << 8);
+    update_motor_state();
 }
 
-void MotorDriver::processTPDO22(const struct can_frame& frame) {
-    if (frame.can_dlc >= 4) {
-        actual_velocity_ = frame.data[0] | (frame.data[1] << 8) | 
-                          (frame.data[2] << 16) | (frame.data[3] << 24);
-    }
+void MotorDriver::process_tpdo21(const can_frame& frame)
+{
+    if (frame.can_dlc < 4) return;
+    actual_position_ = static_cast<int32_t>(
+        static_cast<uint32_t>(frame.data[0])        |
+        (static_cast<uint32_t>(frame.data[1]) <<  8) |
+        (static_cast<uint32_t>(frame.data[2]) << 16) |
+        (static_cast<uint32_t>(frame.data[3]) << 24));
 }
 
-void MotorDriver::processSDOResponse(const struct can_frame& frame) {
-    if (frame.can_dlc < 8) return;
+void MotorDriver::process_sdo_response(const can_frame& frame)
+{
+    if (frame.can_dlc < 4) return;
 
-    uint8_t command = frame.data[0];
-    uint16_t index = frame.data[1] | (frame.data[2] << 8);
-    uint8_t subindex = frame.data[3];
+    const uint8_t  cmd   = frame.data[0];
+    const uint16_t idx   = static_cast<uint16_t>(frame.data[1]) |
+                           (static_cast<uint16_t>(frame.data[2]) << 8);
+    const uint8_t  sub   = frame.data[3];
 
-    // SDO Upload Response
-    if ((command & 0xE0) == 0x40) {
-        if (index == 0x6078 && subindex == 0x00) {
-            // Corriente actual
-            actual_current_ = frame.data[4] | (frame.data[5] << 8);
-        } else if (index == 0x6079 && subindex == 0x00) {
-            // Voltaje DC Bus
-            dc_bus_voltage_ = frame.data[4] | (frame.data[5] << 8);
+    if (cmd == 0x80) {
+        // SDO abort
+        std::cerr << "[MotorDriver:" << static_cast<int>(node_id_)
+                  << "] SDO abort idx=0x" << std::hex << idx
+                  << " sub=0x" << static_cast<int>(sub) << std::dec << '\n';
+        return;
+    }
+
+    // SDO upload response (0x4B=2B, 0x43=4B, 0x4F=1B): bits 7:5 == 0b010
+    if ((cmd & 0xE0) == 0x40 && idx == SDO_IDX_ANALOG_INPUT) {
+        // 0x201A:N → entrada analógica AI(N), subindex 1-based
+        if (sub >= 1 && sub <= 3 && frame.can_dlc >= 6) {
+            const int16_t raw = static_cast<int16_t>(
+                static_cast<uint16_t>(frame.data[4]) |
+                (static_cast<uint16_t>(frame.data[5]) << 8));
+            // raw * 20V / 16384 = volts → ×1000 → mV
+            analog_inputs_mv_[sub - 1] = static_cast<int16_t>(
+                static_cast<int32_t>(raw) * ANALOG_INPUT_MV_NUM / ANALOG_INPUT_MV_DEN);
+            analog_input_valid_ = true;
         }
     }
+    // 0x60xx = SDO download response (write confirmado) — ignorar
 }
 
-void MotorDriver::processNodeGuardResponse(const struct can_frame& frame) {
-    if (frame.can_dlc >= 1) {
-        communication_ok_ = true;
-        resetTimeout(last_heartbeat_time_);
-    }
+// ── Decodificación del StatusWord ────────────────────────────────────────────
+
+void MotorDriver::update_motor_state()
+{
+    const uint16_t sw = status_word_;
+
+    // Máscaras idénticas a las del driver original rbcar (verificadas contra CiA 402)
+    if      ((sw & SW_MASK_SOD)   == SW_SWITCH_ON_DISABLED) drive_state_ = DriveState::SWITCH_ON_DISABLED;
+    else if ((sw & SW_MASK_STATE) == SW_READY_TO_SWITCH_ON)  drive_state_ = DriveState::READY_TO_SWITCH_ON;
+    else if ((sw & SW_MASK_STATE) == SW_OPERATION_DISABLED)  drive_state_ = DriveState::OPERATION_DISABLED;
+    else if ((sw & SW_MASK_STATE) == SW_OPERATION_ENABLED)   drive_state_ = DriveState::OPERATION_ENABLED;
+    else if ((sw & SW_MASK_STATE) == SW_QUICK_STOP_ACTIVE)   drive_state_ = DriveState::QUICK_STOP;
+    else if ((sw & SW_MASK_SOD)   == SW_FAULT)               drive_state_ = DriveState::FAULT;
+    // Si ninguna máscara coincide: drive_state_ no cambia (puede estar en UNKNOWN
+    // durante los primeros ciclos antes de recibir el TPDO1)
 }
 
-void MotorDriver::updateMotorState() {
-    uint16_t sw = status_word_;
+// ── ControlWord helpers ──────────────────────────────────────────────────────
 
-    // Decodificar estado según CiA 402
-    if ((sw & 0x4F) == 0x00) {
-        motor_state_ = MotorState::NOT_READY_TO_SWITCH_ON;
-    } else if ((sw & 0x4F) == 0x40) {
-        motor_state_ = MotorState::SWITCH_ON_DISABLED;
-    } else if ((sw & 0x6F) == 0x21) {
-        motor_state_ = MotorState::READY_TO_SWITCH_ON;
-    } else if ((sw & 0x6F) == 0x23) {
-        motor_state_ = MotorState::SWITCHED_ON;
-    } else if ((sw & 0x6F) == 0x27) {
-        motor_state_ = MotorState::OPERATION_ENABLED;
-    } else if ((sw & 0x6F) == 0x07) {
-        motor_state_ = MotorState::QUICK_STOP_ACTIVE;
-    } else if ((sw & 0x4F) == 0x0F) {
-        motor_state_ = MotorState::FAULT_REACTION_ACTIVE;
-    } else if ((sw & 0x4F) == 0x08) {
-        motor_state_ = MotorState::FAULT;
-    }
+void MotorDriver::send_control_word_sdo(uint16_t cw)
+{
+    // Usado solo durante startup (PRE_OPERATIONAL): el drive acepta SDOs
+    send_sdo_write(SDO_IDX_CONTROL_WORD, SDO_SUB_CONTROL_WORD,
+                   static_cast<uint32_t>(cw), 2);
 }
 
-bool MotorDriver::sendControlWord(uint16_t control_word) {
-    // Versión PDO: usar en modo cíclico, cuando el drive ya está en OPERATIONAL
-    control_word_ = control_word;
-    uint8_t data[2];
-    data[0] = control_word & 0xFF;
-    data[1] = (control_word >> 8) & 0xFF;
-
-    return sendPDO(0x200 + node_id_, data, 2);
+void MotorDriver::send_control_word_pdo(uint16_t cw)
+{
+    // Usado durante operación (OPERATIONAL): RPDO1 ASYNC
+    const uint8_t data[2] = {
+        static_cast<uint8_t>(cw & 0xFF),
+        static_cast<uint8_t>((cw >> 8) & 0xFF)
+    };
+    send_pdo(static_cast<uint16_t>(COB_RPDO1_BASE + node_id_), data, 2);
 }
-
-bool MotorDriver::setTargetPosition(int32_t position) {
-    target_position_ = position;
-    uint8_t data[4];
-    data[0] = position & 0xFF;
-    data[1] = (position >> 8) & 0xFF;
-    data[2] = (position >> 16) & 0xFF;
-    data[3] = (position >> 24) & 0xFF;
-
-    bool ok = sendPDO(0x230 + node_id_, data, 4);
-    if (!ok) {
-        std::cerr << "[MotorDriver] ERROR sending target position PDO, pos=" << position << std::endl;
-    } else {
-        // DEBUG: imprime algunas veces
-        //static int c = 0;
-        //if ((c++ % 50) == 0) {
-        //    std::cout << "[MotorDriver] Sent target position PDO: " << position << std::endl;
-        //}
-    }
-    return ok;
-}
-
-bool MotorDriver::setTargetVelocity(int32_t velocity) {
-    uint8_t data[4];
-    data[0] = velocity & 0xFF;
-    data[1] = (velocity >> 8) & 0xFF;
-    data[2] = (velocity >> 16) & 0xFF;
-    data[3] = (velocity >> 24) & 0xFF;
-    
-    return sendPDO(0x240 + node_id_, data, 4);
-}
-
-bool MotorDriver::enableMotor() {
-    return sendControlWord(static_cast<uint16_t>(MotorCommand::ENABLE_OPERATION));
-}
-
-bool MotorDriver::disableMotor() {
-    return sendControlWord(static_cast<uint16_t>(MotorCommand::DISABLE_OPERATION));
-}
-
-bool MotorDriver::resetFault() {
-    return sendControlWord(static_cast<uint16_t>(MotorCommand::FAULT_RESET));
-}
-
-// motor_driver.cpp
-// ...
-bool MotorDriver::isEnabled() const {
-    // Operation enabled (bit 2) debe estar a 1 (0x0004)
-    // Fault (bit 3) debe estar a 0 (0x0008)
-    // NO verificamos Quick Stop (bit 5) porque puede estar activo en modo normal
-    return (status_word_ & 0x0004) && !(status_word_ & 0x0008);
-}
-// ...

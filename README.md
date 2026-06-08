@@ -1,575 +1,548 @@
-# Caddy AI2 ROS2 Control System Steering Driver
+# caddy_ai2_ros2_control_system_steering_driver
 
-Sistema de control de dirección para ROS2 Control utilizando CANopen sobre SocketCAN.
+Driver de dirección para **ROS2 Control** sobre CANopen.  
+Controla un motor **DZCANTE-020L080** de AMC (CiA 402, Profile Position) y soporta dos variantes de feedback de posición:
 
-## TODOs:
-- [ ] Cambiar el código de tipo sistema a tipo actuador
+| Variante | Feedback | Fuente |
+|---|---|---|
+| **Potenciómetro** | Entrada analógica del DZCANTE | SDO polling `0x201A:subindex` |
+| **Encoder EPC** | Encoder absoluto CANopen externo | TPDO1 estándar `0x180 + enc_node_id` |
 
-## 📋 Descripción
+El paquete es **auto-contenido**: `SocketCANInterface` está incluido, sin dependencia de `caddy_ai2_ros2_common`.  
+Incluye tres ejecutables de test que funcionan sin el stack de ROS2.
 
-Este paquete implementa un hardware interface de ROS2 Control para un sistema de dirección basado en:
-- **Motor driver** con protocolo CANopen (CiA 402)
-- **Encoder absoluto** externo con protocolo CANopen
-- **Comunicación CAN** mediante SocketCAN (Linux)
+---
 
-El sistema permite controlar la posición angular de la dirección con alta precisión y frecuencias de actualización configurables.
-
-## 🏗️ Arquitectura
+## Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    ROS2 Control Manager                      │
-│                    (500 Hz configurable)                     │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│           SystemSteeringHardware (Hardware Interface)        │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  • Gestión de frecuencias (ratio, multiplicidades)   │   │
-│  │  • Conversión radianes ↔ encoder counts             │   │
-│  │  • Offsets de lectura/escritura                     │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                         │                                    │
-│                         ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │           SteeringController                         │   │
-│  │  ┌────────────────┐  ┌────────────────┐             │   │
-│  │  │  MotorDriver   │  │ EncoderDriver  │             │   │
-│  │  │  (Node ID: 1)  │  │ (Node ID: 127) │             │   │
-│  │  │  • CiA 402     │  │  • Posición    │             │   │
-│  │  │  • PDO/SDO     │  │    absoluta    │             │   │
-│  │  │  • Control     │  │  • Filtrado    │             │   │
-│  │  └────────────────┘  └────────────────┘             │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                         │                                    │
-│                         ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │         SocketCANInterface                           │   │
-│  │  • Socket CAN RAW                                    │   │
-│  │  • Epoll para lectura eficiente                     │   │
-│  │  • Non-blocking I/O                                 │   │
-│  └──────────────────────────────────────────────────────┘   │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-                  ┌─────────────┐
-                  │   CAN Bus   │
-                  │  (can0/vcan)│
-                  └─────────────┘
-                         │
-        ┌────────────────┴────────────────┐
-        ▼                                 ▼
-  ┌──────────┐                     ┌──────────┐
-  │  Motor   │                     │ Encoder  │
-  │ CANopen  │                     │ CANopen  │
-  └──────────┘                     └──────────┘
+ROS2 Controller Manager (500 Hz)
+        │
+        ▼
+SystemSteeringHardware          ← hardware_interface::SystemInterface
+  read()  → cycle_read(dt)      ← SDO poll + SYNC → drain CAN → update FSMs
+  write() → cycle_write()       ← set target position (ASYNC RPDO21)
+        │
+        ▼
+SteeringController              ← sin ROS, sin hilos propios
+  ├── MotorDriver               ← CANopen CiA 402 (DZCANTE-020L080)
+  │     • NMT watchdog + NodeGuard periódico
+  │     • DS402 state machine (tick_ds402)
+  │     • TPDO1  StatusWord    / TPDO21 ActualPosition
+  │     • RPDO1  ControlWord   / RPDO21 TargetPosition
+  │     • SDO 0x201A → entradas analógicas AI1/AI2/AI3  (variante POT)
+  └── EncoderDriver (*)         ← encoder absoluto CAN externo (variante EPC)
+        • NMT watchdog
+        • TPDO1 posición absoluta (4 bytes LE)
+        │
+        ▼
+SocketCANInterface              ← socket RAW + epoll, non-blocking
+        │
+        ▼
+     CAN Bus (can_steer_drv / vcan0)
+        │
+   ┌────┴──────────────────┐
+Motor (node 1)      Encoder (*) (node 127)
 ```
 
-## 📦 Componentes
+`(*) EncoderDriver solo presente en la variante EPC encoder.`
 
-### 1. **SystemSteeringHardware**
-Hardware interface principal que implementa `hardware_interface::SystemInterface`.
+---
 
-**Características:**
-- Gestión de frecuencias múltiples (controller manager vs hardware)
-- Multiplicidades de lectura/escritura configurables
-- Offsets independientes para read/write
-- Conversión automática radianes ↔ encoder counts
+## COB-IDs y objetos SDO del DZCANTE-020L080
 
-### 2. **SteeringController**
-Controlador de alto nivel que coordina motor y encoder.
+El drive AMC usa un mapping **propietario**, distinto al estándar CANopen:
 
-**Funciones:**
-- `init()`: Inicializa comunicación CAN y dispositivos CANopen
-- `step()`: Ejecuta un ciclo de control (procesa CAN, actualiza estados)
-- `setTargetSteeringPosition()`: Establece posición objetivo
-- `getAbsoluteEncoderPosition()`: Lee posición del encoder absoluto
-- `shutdown()`: Apaga el motor de forma segura
+| Objeto | Dir. | COB-ID / Índice | Contenido | Trans. |
+|--------|------|-----------------|-----------|--------|
+| RPDO1  | master→drive | `0x180 + node_id` | ControlWord (2 B) | ASYNC |
+| RPDO21 | master→drive | `0x280 + node_id` | TargetPosition (int32 LE) | ASYNC |
+| TPDO1  | drive→master | `0x4A0 + node_id` | StatusWord (2 B) | cada 10 SYNCs |
+| TPDO21 | drive→master | `0x400 + node_id` | ActualPosition (int32 LE) | cada SYNC |
+| NodeGuard RTR | master→drive | `(0x700+node_id)\|RTR` | — | periódico |
+| **SDO AI req.**  | master→drive | `0x600 + node_id` | upload req. `0x201A:pin+1` | polling |
+| **SDO AI resp.** | drive→master | `0x580 + node_id` | int16 LE, ±16384 → ±20 V | respuesta |
 
-### 3. **MotorDriver** (CiA 402)
-Driver para motor con protocolo CANopen CiA 402.
+El encoder EPC externo usa TPDO1 **estándar** (`0x180 + enc_node_id`).
 
-**Estados del motor:**
-- `NOT_READY_TO_SWITCH_ON`
-- `SWITCH_ON_DISABLED`
-- `READY_TO_SWITCH_ON`
-- `SWITCHED_ON`
-- `OPERATION_ENABLED` ✓
-- `FAULT`
+> **Nota:** el DZCANTE **no** emite TPDO4 (`0x480+nid`) con las entradas analógicas por defecto.
+> La lectura de AI se hace por **SDO polling** al objeto propietario `0x201A` cada ciclo.
+>
+> Conversión: `mV = raw_int16 × 20000 / 16384`
 
-**Funciones principales:**
-- `initialize()`: Configura PDOs, TPDOs, NodeGuard
-- `enableMotor()`: Habilita el motor (transición a OPERATION_ENABLED)
-- `setTargetPosition()`: Envía posición objetivo
-- `getActualPosition()`: Lee posición actual del encoder del motor
+---
 
-### 4. **EncoderDriver**
-Driver para encoder absoluto externo.
+## Ciclo de control
 
-**Funciones:**
-- `initialize()`: Configura TPDOs y NodeGuard
-- `getAbsolutePosition()`: Posición absoluta raw
-- `getFilteredPosition()`: Posición filtrada
-- `isValid()`: Estado de validez del encoder
+```
+read()
+  ├── [POT mode] motor.poll_analog_input(pin)   ← SDO upload req 0x201A:pin+1
+  ├── send_sync()                                ← dispara TPDOs síncronos
+  ├── receive_frames()                           ← drain no bloqueante (timeout=0)
+  ├── motor.update(dt)                           ← watchdog NMT + tick_ds402
+  └── [EPC mode] encoder.update(dt)              ← watchdog NMT
 
-### 5. **SocketCANInterface**
-Interfaz de bajo nivel para comunicación CAN.
-
-**Características:**
-- Socket CAN en modo RAW
-- Non-blocking I/O con epoll
-- Lectura eficiente de múltiples frames
-- Timeout configurable
-
-### 6. **CANOpenDriver** (Clase base)
-Clase base abstracta para dispositivos CANopen.
-
-**Funcionalidades comunes:**
-- Gestión de estados NMT
-- Envío de SDO/PDO
-- NodeGuard/Heartbeat
-- Timeouts
-
-## 🔧 Configuración
-
-### Parámetros del Hardware Interface
-
-```yaml
-hardware:
-  plugin: caddy_ai2_ros2_control_system_steering_driver/SystemSteeringHardware
-  
-  # Comunicación CAN
-  interface_name: "can0"                    # Interfaz CAN (can0, vcan0, etc.)
-  
-  # Frecuencias
-  controller_manager_frequency_hz: 500      # Frecuencia del controller manager
-  hardware_sample_frequency_hz: 50          # Frecuencia del hardware CAN
-  
-  # Multiplicidades (cuántos ciclos esperar antes de leer/escribir)
-  read_multiplicity: 1                      # Multiplicidad base de lectura
-  write_multiplicity: 1                     # Multiplicidad base de escritura
-  
-  # Offsets (retraso en ciclos)
-  read_offset: 0                            # Offset de lectura en ciclos
-  write_offset: 0                           # Offset de escritura en ciclos
-  
-  # Parámetros CANopen
-  motor_node_id: 1                          # Node ID del motor
-  encoder_node_id: 127                      # Node ID del encoder
-  counts_per_radian: 100000.0               # Factor de conversión
+write()
+  └── set_target_position(counts) + cycle_write()   ← RPDO21 si OPERATION_ENABLED
 ```
 
-## 🔌 Configuración de Hardware Real
+El SYNC va **siempre antes** del drain: sin él el drive no envía StatusWord ni ActualPosition.  
+La respuesta SDO de `poll_analog_input()` llega en el siguiente `receive_frames()` (~20 ms).
 
-### Paso 1: Configurar adaptador USB-CAN
+---
 
-El paquete incluye un script interactivo para configurar automáticamente tu adaptador USB-CAN:
+## Máquinas de estado
+
+**NMT** (watchdog 2 s — reiniciado por cada NodeGuard response):
+```
+UNKNOWN → PRE_OPERATIONAL → OPERATIONAL
+                                  ↓ sin respuesta NodeGuard > 2 s
+                                FAULT
+```
+
+**DS402** (`tick_ds402`, intervalo mínimo 50 ms):
+```
+SWITCH_ON_DISABLED → READY_TO_SWITCH_ON → OPERATION_DISABLED → OPERATION_ENABLED
+       ↑                                                               ↓
+   QUICK_STOP ←─────────────────────────────────────────────────────-─┘
+       ↕
+     FAULT  (auto-reset vía FAULT_RESET ControlWord)
+```
+
+---
+
+## Calibración
+
+### Motor (command: ángulo → counts)
+
+```
+actuator_zero        = (actuator_encoder_left  + actuator_encoder_right) / 2
+actuator_counts/rad  = (actuator_encoder_left  - actuator_encoder_right) / (2 × range)
+counts               = actuator_zero + angle_rad × actuator_counts/rad
+```
+
+Valores por defecto (rbcar): `left=99100`, `right=−97500` → `zero=800`, `scale≈171047 counts/rad`
+
+### Feedback EPC (state: encoder counts → ángulo)
+
+```
+epc_rad/count  = −2 × range / (reading_encoder_right − reading_encoder_left)
+angle_rad      = (epc_counts − reading_encoder_zero_position) × epc_rad/count
+```
+
+Signo negativo: count bajo → límite izquierdo → ángulo positivo.  
+Valores por defecto (rbcar): `left=880`, `right=4520`, `zero=2650`, `range=0.5747 rad`
+
+### Feedback potenciómetro (state: mV → ángulo)
+
+```
+pot_rad/mV  = −2 × range / (potentiometer_right_mv − potentiometer_left_mv)
+angle_rad   = (pot_mv − potentiometer_zero_mv) × pot_rad/mV
+```
+
+> **Los valores `potentiometer_*_mv` son placeholders** y deben calibrarse físicamente.  
+> Usa `test_passive` para leer los mV reales en cada límite y en posición recta.
+
+---
+
+## Parámetros URDF
+
+```xml
+<hardware>
+  <plugin>caddy_ai2_ros2_control_system_steering_driver/SystemSteeringHardware</plugin>
+
+  <!-- CAN -->
+  <param name="can_interface_name">can_steer_drv</param>
+  <param name="motor_node_id">1</param>
+
+  <!-- Feedback: 0=potenciómetro, 1=encoder EPC -->
+  <param name="feedback_mode">0</param>
+  <param name="encoder_node_id">127</param>      <!-- solo si feedback_mode=1 -->
+  <param name="analog_input_pin">2</param>       <!-- 0-based: 0=AI1,1=AI2,2=AI3 -->
+
+  <!-- Calibración del actuador (counts del encoder del motor en cada límite físico) -->
+  <param name="actuator_encoder_left">99100</param>
+  <param name="actuator_encoder_right">-97500</param>
+
+  <!-- Calibración encoder EPC (solo si feedback_mode=1) -->
+  <param name="reading_encoder_left">880</param>
+  <param name="reading_encoder_right">4520</param>
+  <param name="reading_encoder_zero_position">2650</param>
+  <param name="reading_encoder_resolution">4096</param>
+
+  <!-- Calibración potenciómetro (solo si feedback_mode=0) — ajustar con test_passive -->
+  <param name="potentiometer_left_mv">0</param>
+  <param name="potentiometer_right_mv">5000</param>
+  <param name="potentiometer_zero_mv">2500</param>
+
+  <!-- Rango máximo de dirección (rad) -->
+  <param name="steering_angle_range">0.5747</param>
+
+  <!-- Temporización -->
+  <param name="controller_manager_frequency_hz">500</param>
+  <param name="hardware_sample_frequency_hz">500</param>
+  <param name="read_multiplicity">1</param>    <!-- ciclos CM entre lecturas CAN -->
+  <param name="write_multiplicity">10</param>  <!-- ciclos CM entre escrituras CAN -->
+  <param name="read_offset">0</param>
+  <param name="write_offset">1</param>
+</hardware>
+```
+
+### Frecuencias efectivas
+
+```
+ratio          = ceil(controller_manager_hz / hardware_sample_hz)   (mín. 1)
+read_rate_hz   = controller_manager_hz / (read_multiplicity  × ratio)
+write_rate_hz  = controller_manager_hz / (write_multiplicity × ratio)
+```
+
+Con los valores por defecto (CM=500 Hz, HW=500 Hz, ratio=1):  
+`read_rate = 500 Hz`, `write_rate = 50 Hz`
+
+---
+
+## Instalación
 
 ```bash
-cd ~/ws_caddy_dev_ros2/src/caddy_ai2_ros2_control_system_steering_driver
-chmod +x scripts/setup_can_steer_drv.sh
-./scripts/setup_can_steer_drv.sh
+sudo apt install ros-jazzy-ros2-control ros-jazzy-ros2-controllers can-utils
 
-### Cálculo de Frecuencias
-
-El sistema calcula automáticamente:
-
-```
-frequency_ratio = controller_manager_frequency_hz / hardware_sample_frequency_hz
-effective_read_multiplicity = read_multiplicity × frequency_ratio
-effective_write_multiplicity = write_multiplicity × frequency_ratio
-
-Frecuencia real de lectura = controller_manager_frequency_hz / effective_read_multiplicity
-Frecuencia real de escritura = controller_manager_frequency_hz / effective_write_multiplicity
-```
-
-**Ejemplo:**
-- Controller manager: 500 Hz
-- Hardware: 50 Hz
-- Read multiplicity: 1
-- Write multiplicity: 1
-
-```
-frequency_ratio = 500 / 50 = 10
-effective_read_multiplicity = 1 × 10 = 10
-effective_write_multiplicity = 1 × 10 = 10
-
-Frecuencia real lectura = 500 / 10 = 50 Hz ✓
-Frecuencia real escritura = 500 / 10 = 50 Hz ✓
-```
-
-### Offsets de Lectura/Escritura
-
-Los offsets permiten desfasar las operaciones de lectura y escritura:
-
-```
-Timeline (ciclos del controller manager @ 500 Hz):
-
-Ciclo:  0   1   2   3   4   5   6   7   8   9   10  11  12
-        │   │   │   │   │   │   │   │   │   │   │   │   │
-Read:   ─   ─   R   ─   ─   ─   ─   ─   ─   ─   R   ─   ─   (offset=2, mult=10)
-Write:  W   ─   ─   ─   ─   ─   ─   ─   ─   ─   W   ─   ─   (offset=0, mult=10)
-```
-
-## 🚀 Instalación
-
-### Dependencias
-
-```bash
-# ROS2 Humble
-sudo apt install ros-humble-ros2-control ros-humble-ros2-controllers
-
-# CAN tools
-sudo apt install can-utils
-
-# Compilación
-sudo apt install build-essential cmake
-```
-
-### Compilar el paquete
-
-```bash
-cd ~/ws_caddy_dev_ros2
+cd ~/muppet_ws
 colcon build --packages-select caddy_ai2_ros2_control_system_steering_driver
 source install/setup.bash
 ```
 
-## 🧪 Pruebas
+---
 
-### 1. Configurar CAN Virtual
+## Configurar la interfaz CAN
+
+### CAN virtual (sin hardware)
 
 ```bash
-# Cargar módulo vcan
-sudo modprobe vcan
-
-# Crear interfaz virtual
-sudo ip link add dev vcan_steer_drv type vcan
-sudo ip link set up vcan_steer_drv
-
-# Verificar
-ip link show vcan_steer_drv
+sudo ./install/caddy_ai2_ros2_control_system_steering_driver/lib/\
+caddy_ai2_ros2_control_system_steering_driver/setup_vcan_steer_drv.sh
 ```
 
-O usar el script proporcionado:
+### Adaptador USB-CAN físico
 
 ```bash
-sudo ./scripts/setup_vcan_steer_drv.sh
+./install/caddy_ai2_ros2_control_system_steering_driver/lib/\
+caddy_ai2_ros2_control_system_steering_driver/setup_can_steer_drv.sh
+# Interactivo: detecta el adaptador y crea la regla udev (nombre: can_steer_drv)
 ```
 
-### 2. Monitorear CAN (terminal separada)
+---
+
+## Lanzar el sistema
 
 ```bash
-candump vcan_steer_drv
-```
+# Hardware real
+ros2 launch caddy_ai2_ros2_control_system_steering_driver system_steering.launch.py
 
-### 3. Lanzar el sistema
-
-```bash
+# CAN virtual
 ros2 launch caddy_ai2_ros2_control_system_steering_driver virtual_system_steering.launch.py
 ```
 
-### 4. Enviar comandos de prueba
+---
+
+## Tests standalone (sin ROS)
+
+Tres ejecutables independientes que no requieren el stack de ROS2.  
+Ruta tras compilar: `./build/caddy_ai2_ros2_control_system_steering_driver/`
+
+---
+
+### `test_standalone` — monitor simple
+
+Inicializa el drive, espera `OPERATION_ENABLED` y mantiene posición 0.  
+Muestra estado y lectura de potenciómetro cada segundo. Smoke-test básico.
 
 ```bash
-# Publicar posición objetivo (radianes)
-ros2 topic pub /forward_position_controller/commands std_msgs/msg/Float64MultiArray "data: [0.5]"
+./test_standalone <can> [motor_id]
 
-# Ver estado actual
-ros2 topic echo /joint_states
+# Ejemplo:
+./test_standalone can_steer_drv 1
 ```
 
-## 🔌 Hardware Real
+Salida:
+```
+=== Steering Driver — Test Simple ===
+  CAN       : can_steer_drv
+  motor_id  : 1
 
-### Configurar interfaz CAN física
+[init] OK
+[espera] Listo
+
+t_s     motor_pos   pot_mV  NMT           DS402
+----------------------------------------------------
+1.0     312         2487    OPERATIONAL   OP_ENA
+2.0     310         2489    OPERATIONAL   OP_ENA
+```
+
+---
+
+### `test_calibration` — calibración del potenciómetro
+
+Calcula automáticamente los tres parámetros `potentiometer_*_mv` del URDF.  
+Usa regresión lineal sobre los pares `(motor_pos, AI_mV)` recogidos mientras mueves la rueda.
 
 ```bash
-# Configurar bitrate (ejemplo: 500 kbps)
-sudo ip link set can0 type can bitrate 500000
+./test_calibration <can> [motor_id] [analog_pin]
 
-# Activar interfaz
-sudo ip link set up can0
-
-# Verificar
-ip -details link show can0
+# Ejemplo: potenciómetro en AI1 (pin 0)
+./test_calibration can_steer_drv 1 0
 ```
 
-### Actualizar configuración
+**Procedimiento:**
+1. Pon la rueda **recta** antes de ejecutar el programa — el primer valor leído se registra como referencia de 0 rad.
+2. Mueve la rueda lentamente de un límite físico al otro (varios ciclos si es posible).
+3. Pulsa Ctrl+C.
 
-Edita `description/ros2_control/system_steering.ros2_control.urdf`:
+Salida mientras se ejecuta:
+```
+[zero] Referencia 0 rad capturada:  motor_pos=312  AI_mV=2487
 
-```xml
-<param name="interface_name">can0</param>  <!-- Cambiar de vcan_steer_drv a can0 -->
+motor_pos   AI_mV    |  min_pos     max_pos     min_mV    max_mV    N
+------------------------------------------------------------------------------
+79051       3372     |  -97500      99100       200       3800      6250
 ```
 
-### Ajustar parámetros CANopen
+Salida al salir:
+```
+============================================================
+  N muestras : 6250
 
-Según tu hardware específico:
+  motor_pos  min=-97500  max=99100
+  AI1_mV     min=200     max=3800
 
-```xml
-<param name="motor_node_id">1</param>           <!-- Node ID del motor -->
-<param name="encoder_node_id">127</param>       <!-- Node ID del encoder -->
-<param name="counts_per_radian">100000.0</param> <!-- Ajustar según resolución -->
+  Regresión lineal:
+    AI_mV = 0.00962 × motor_pos + 2419.3
+    Pearson r = 0.9991  (excelente)
+
+  Parámetros URDF sugeridos
+  --------------------------------------------------------
+  potentiometer_left_mv   = 3372
+  potentiometer_right_mv  = 1479
+  potentiometer_zero_mv   = 2487  (medido)
+============================================================
 ```
 
-**Cálculo de `counts_per_radian`:**
+Copia los tres valores en [system_steering.ros2_control.urdf](description/ros2_control/system_steering.ros2_control.urdf) y recompila.
 
-```
-counts_per_radian = (encoder_resolution × gear_ratio) / (2 × π)
+---
 
-Ejemplo:
-- Encoder: 4096 counts/rev
-- Gear ratio: 154:1
-- counts_per_radian = (4096 × 154) / (2 × π) ≈ 100,330
-```
+### `test_passive` — escucha sin mover el motor
 
-## 📊 Monitoreo y Diagnóstico
-
-### Ver logs del hardware
+Envía NMT START y SYNC pero **no ejecuta la secuencia DS402**.  
+Imprime todos los frames recibidos y un resumen de valores cada segundo.  
+**Imprescindible para calibrar los valores `potentiometer_*_mv`.**
 
 ```bash
-ros2 run rqt_console rqt_console
+./test_passive <can> [motor_id] [analog_pin]
+
+# Ejemplo: leer AI3 (pin 2) del motor en nodo 1
+./test_passive can_steer_drv 1 2
 ```
 
-### Inspeccionar estado del controller
+Salida:
+```
+  0x401  dlc=4  [28 01 00 00 -- -- -- --]  TPDO21-POS  pos=296
+  0x581  dlc=8  [4b 1a 20 03 80 09 00 00]  SDO-RSP  cmd=0x4b
+  0x4a1  dlc=2  [27 06 -- -- -- -- -- --]  TPDO1-SW  sw=0x627
+  0x701  dlc=1  [05 -- -- -- -- -- -- --]  NMT  state=OPERATIONAL(0x5)
+----------------------------------------------------------------------------
+[Resumen t=1.0s]
+  AI1=2487mV  AI2=155mV  AI3=12mV  --> pin2=12mV
+  motor_pos=296
+  status_word=0x627
+```
+
+Mueve la rueda hasta cada límite físico y anota el valor `-->` para actualizar  
+`potentiometer_left_mv`, `potentiometer_right_mv` y `potentiometer_zero_mv` en el URDF.
+
+---
+
+### `test_sinusoidal` — seguimiento senoidal activo
+
+Hace seguir al motor una referencia sinusoidal entre dos límites en counts.  
+Soporta feedback por potenciómetro (`fb_mode=0`) o encoder EPC (`fb_mode=1`).
+
+```bash
+./test_sinusoidal <can> <motor_id> <fb_mode> <fb_param> <min> <max> [freq_hz] [cycles]
+
+#   fb_mode  0 = potenciómetro
+#   fb_mode  1 = encoder EPC
+#   fb_param si fb_mode=0: pin analógico 0-based (0=AI1, 1=AI2, 2=AI3)
+#   fb_param si fb_mode=1: node_id del encoder
+
+# Potenciómetro en AI3, rango ±90000 counts, 0.05 Hz × 3 ciclos:
+./test_sinusoidal can_steer_drv 1 0 2 -90000 90000 0.05 3
+
+# Encoder EPC en nodo 127:
+./test_sinusoidal can_steer_drv 1 1 127 -90000 90000 0.05 3
+```
+
+Salida:
+```
+t_s    ref       motor_pos   error     pot_mV      NMT           DS402
+---------------------------------------------------------------------------
+0.20   0         312         -312      2487        OPERATIONAL   OP_ENA
+0.40   2827      3105        -278      2651        OPERATIONAL   OP_ENA
+```
+
+---
+
+## Monitoreo CAN
+
+```bash
+# Todo el tráfico
+candump can_steer_drv
+
+# Solo TPDOs del motor (node_id=1)
+candump can_steer_drv,4A1:7FF,401:7FF
+
+# Respuestas SDO con valores analógicos (0x201A)
+candump can_steer_drv,581:7FF
+
+# Estadísticas de la interfaz
+ip -s link show can_steer_drv
+```
+
+---
+
+## Enviar comandos de posición
+
+El controlador es un `JointGroupPositionController` que escucha en:
+
+```
+/steering/system_steering_controller/commands   (std_msgs/msg/Float64MultiArray)
+```
+
+El valor es en **radianes**. Límites del joint: `[-0.4, 0.4]` rad.
+
+```bash
+# Posición recta
+ros2 topic pub --once /steering/system_steering_controller/commands \
+  std_msgs/msg/Float64MultiArray "data: [0.0]"
+
+# Girar a la izquierda (~20°)
+ros2 topic pub --once /steering/system_steering_controller/commands \
+  std_msgs/msg/Float64MultiArray "data: [0.35]"
+
+# Girar a la derecha (~20°)
+ros2 topic pub --once /steering/system_steering_controller/commands \
+  std_msgs/msg/Float64MultiArray "data: [-0.35]"
+
+# Envío continuo a 10 Hz (mantiene la posición activa)
+ros2 topic pub -r 10 /steering/system_steering_controller/commands \
+  std_msgs/msg/Float64MultiArray "data: [0.0]"
+```
+
+## Diagnóstico con ros2_control
 
 ```bash
 ros2 control list_controllers
 ros2 control list_hardware_interfaces
+ros2 topic echo /steering/joint_states
 ```
 
-### Verificar frecuencias
+---
 
-Los logs muestran:
-```
-[SystemSteeringHardware] === Configuración del Hardware de Dirección ===
-[SystemSteeringHardware] Interfaz CAN: can0
-[SystemSteeringHardware] Frecuencia controller_manager: 500.00 Hz
-[SystemSteeringHardware] Frecuencia del hardware: 50.00 Hz
-[SystemSteeringHardware] Ratio de frecuencias: 10
-[SystemSteeringHardware] Frecuencia real - Lectura: 50.00 Hz, Escritura: 50.00 Hz
-```
-
-### Herramientas CAN
-
-```bash
-# Ver mensajes CAN en tiempo real
-candump can0
-
-# Enviar mensaje CAN manual
-cansend can0 181#0000000000000000
-
-# Estadísticas de la interfaz
-ip -s link show can0
-
-# Ver errores CAN
-cat /sys/class/net/can0/statistics/tx_errors
-```
-
-## ⚡ Optimización para Tiempo Real
-
-### 1. Kernel RT-PREEMPT
-
-```bash
-# Instalar kernel RT
-sudo apt install linux-image-rt-amd64
-
-# Verificar
-uname -a  # Debe mostrar "PREEMPT RT"
-```
-
-### 2. Configurar parámetros del kernel
-
-Edita `/etc/default/grub`:
-
-```bash
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash \
-    isolcpus=2,3 \
-    nohz_full=2,3 \
-    rcu_nocbs=2,3 \
-    intel_pstate=disable \
-    processor.max_cstate=1 \
-    idle=poll"
-```
-
-Actualizar GRUB:
-
-```bash
-sudo update-grub
-sudo reboot
-```
-
-### 3. Asignar CPUs aisladas al controller manager
-
-```bash
-# Lanzar con taskset
-taskset -c 2 ros2 launch caddy_ai2_ros2_control_system_steering_driver virtual_system_steering.launch.py
-```
-
-### 4. Prioridad de proceso
-
-```bash
-# Ejecutar con prioridad RT
-sudo chrt -f 80 ros2 launch ...
-```
-
-### 5. Medir latencia
-
-```bash
-# Instalar herramientas
-sudo apt install rt-tests
-
-# Medir latencia en CPU aislada
-sudo cyclictest -p 80 -t1 -n -i 1000 -l 100000 -a 2
-```
-
-**Objetivo:**
-- Min: < 10 µs
-- Avg: < 20 µs
-- Max: < 100 µs
-
-## 📁 Estructura del Proyecto
+## Estructura del paquete
 
 ```
 caddy_ai2_ros2_control_system_steering_driver/
-├── bringup/
-│   ├── config/
-│   │   └── system_steering.yaml              # Configuración de controladores
-│   └── launch/
-│       └── virtual_system_steering.launch.py # Launch file
-├── description/
-│   ├── ros2_control/
-│   │   └── system_steering.ros2_control.urdf # Configuración hardware interface
-│   └── urdf/
-│       └── system_steering.urdf.xacro        # Descripción URDF
-├── include/
-│   └── caddy_ai2_ros2_control_system_steering_driver/
-│       ├── system_steering_hardware.hpp      # Hardware interface
-│       ├── steering_controller.hpp           # Controlador de dirección
-│       ├── motor_driver.hpp                  # Driver motor CANopen
-│       ├── encoder_driver.hpp                # Driver encoder CANopen
-│       ├── canopen_driver.hpp                # Clase base CANopen
-│       └── socket_can_interface.hpp          # Interfaz SocketCAN
+├── include/…/
+│   ├── dzcante020l080_constants.hpp   ← COB-IDs, CW, SDO (0x201A), timeouts
+│   ├── socket_can_interface.hpp       ← SocketCAN RAW + epoll (paquete auto-contenido)
+│   ├── canopen_driver.hpp             ← base: NMT, NodeGuard, SDO/PDO primitives
+│   ├── motor_driver.hpp               ← CiA 402, DS402 FSM, SDO analog (0x201A)
+│   ├── encoder_driver.hpp             ← encoder absoluto CAN externo
+│   ├── steering_controller.hpp        ← fachada: FeedbackSource, cycle_read/write
+│   └── system_steering_hardware.hpp   ← hardware_interface::SystemInterface
 ├── src/
-│   ├── system_steering_hardware.cpp
-│   ├── steering_controller.cpp
+│   ├── socket_can_interface.cpp
+│   ├── canopen_driver.cpp
 │   ├── motor_driver.cpp
 │   ├── encoder_driver.cpp
-│   ├── canopen_driver.cpp
-│   └── socket_can_interface.cpp
+│   ├── steering_controller.cpp
+│   └── system_steering_hardware.cpp
+├── test/
+│   ├── test_standalone.cpp            ← monitor simple, posición 0 (sin ROS)
+│   ├── test_passive.cpp               ← escucha sin DS402, calibración POT
+│   └── test_sinusoidal.cpp            ← seguimiento senoidal activo
+├── bringup/
+│   ├── config/system_steering.yaml
+│   └── launch/
+│       ├── system_steering.launch.py
+│       └── virtual_system_steering.launch.py
+├── description/
+│   ├── ros2_control/system_steering.ros2_control.urdf
+│   └── urdf/system_steering.urdf.xacro
 ├── scripts/
-│   └── setup_vcan_steer_drv.sh              # Script configuración CAN virtual
-├── caddy_ai2_ros2_control_system_steering_driver.xml  # Plugin description
-├── CMakeLists.txt
-├── package.xml
-└── README.md
+│   ├── setup_can_steer_drv.sh
+│   └── setup_vcan_steer_drv.sh
+└── manual_up_can_interface.md
 ```
 
-## 🐛 Troubleshooting
+---
 
-### Error: "No existe el archivo o el directorio can0"
+## Troubleshooting
+
+### Motor no responde tras `init()`
+
+- Verificar con `candump` que llegan frames NMT (`000#`) y SDO (`601#` para nodo 1)
+- Comprobar que el drive responde al NodeGuard RTR: debe aparecer `701#05` o `701#85`
+- Verificar bitrate del bus CAN (el DZCANTE suele ir a 1 Mbps)
+- Revisar terminación del bus (120 Ω en cada extremo)
+
+### NMT pasa a FAULT tras 2 s
+
+- El NodeGuard RTR no recibe respuesta: `candump` debe mostrar `701#R` (RTR enviada) y `701#05`/`701#85` (respuesta del drive)
+- Comprobar que el guard time está configurado en el drive (`0x100C > 0`)
+
+### `pot_mV` siempre a 0 o no varía
+
+- Verificar que el drive responde al SDO `0x201A`: `candump can_steer_drv,581:7FF`
+- Comprobar el subindex: el driver envía `pin+1` (AI3 = subindex 3, `0x201A:3`)
+- Usar `test_passive` para ver los frames raw y confirmar qué AI tiene el potenciómetro conectado
+
+### Timeout en `on_activate` (OPERATION_ENABLED no alcanzado)
+
+- El drive puede tener un FAULT previo: ejecutar `test_standalone` para ver el DS402 en detalle
+- Comprobar que la tensión del bus DC del DZCANTE está dentro de rango
+- En variante EPC: verificar que el encoder responde al SYNC (`candump` muestra `1FF#`)
+
+### Encoder no válido (`is_valid() == false`)
+
+- Verificar que el SYNC llega al encoder: `candump` debe mostrar `080#`
+- Comprobar que el encoder responde con TPDO1 en `0x180 + enc_node_id`
+- Default `enc_node_id=127` → frames en `0x1FF`
+
+### Limpiar y recompilar
 
 ```bash
-# Verificar interfaces CAN disponibles
-ip link show
-
-# Si no existe, crear interfaz virtual
-sudo ip link add dev can0 type vcan
-sudo ip link set up can0
+cd ~/muppet_ws
+rm -rf build/caddy_ai2_ros2_control_system_steering_driver \
+        install/caddy_ai2_ros2_control_system_steering_driver
+colcon build --packages-select caddy_ai2_ros2_control_system_steering_driver
 ```
 
-### Error: "Operation not permitted" al configurar CAN
+---
+
+## Optimización tiempo real
+
+El sistema usa kernel RT (`uname -a` debe mostrar `PREEMPT_RT`). Para el controller manager:
 
 ```bash
-# Ejecutar con sudo
-sudo ip link set can0 type can bitrate 500000
-sudo ip link set up can0
+taskset -c 2 sudo chrt -f 80 ros2 launch \
+  caddy_ai2_ros2_control_system_steering_driver system_steering.launch.py
 ```
 
-### Motor no responde
+Latencia objetivo con `cyclictest`: avg < 20 µs, max < 100 µs.
 
-1. Verificar Node ID correcto
-2. Comprobar bitrate del CAN bus
-3. Verificar cableado CAN (CANH, CANL, GND)
-4. Revisar terminación del bus CAN (120Ω en ambos extremos)
-5. Monitorear con `candump` para ver si hay tráfico
+---
 
-### Encoder no válido
+## Licencia
 
-1. Verificar alimentación del encoder
-2. Comprobar Node ID
-3. Revisar configuración de TPDOs
-4. Verificar que el encoder esté en modo OPERATIONAL
-
-### Latencia alta
-
-1. Verificar frecuencias configuradas
-2. Reducir `hardware_sample_frequency_hz` si es muy alta
-3. Aplicar optimizaciones de tiempo real (ver sección anterior)
-4. Verificar carga del sistema: `htop`
-
-### Errores de compilación
-
-```bash
-# Limpiar build
-cd ~/ws_caddy_dev_ros2
-rm -rf build/ install/ log/
-
-# Recompilar
-colcon build --packages-select caddy_ai2_ros2_control_system_steering_driver --cmake-clean-cache
-```
-
-## 📚 Referencias
-
-- [ROS2 Control Documentation](https://control.ros.org/)
-- [CANopen CiA 402 Specification](https://www.can-cia.org/can-knowledge/canopen/cia402/)
-- [SocketCAN Documentation](https://www.kernel.org/doc/html/latest/networking/can.html)
-- [RT-PREEMPT Howto](https://wiki.linuxfoundation.org/realtime/start)
-
-## 📝 TODO
-
-- [ ] Implementar control de velocidad
-- [ ] Añadir límites de posición configurables
-- [ ] Implementar safety stops
-- [ ] Añadir diagnósticos extendidos
-- [ ] Soporte para múltiples motores
-- [ ] Calibración automática de `counts_per_radian`
-- [ ] Interfaz de configuración dinámica (dynamic_reconfigure)
-- [ ] Tests unitarios
-- [ ] Documentación de la API
-
-## 👥 Autores
-
-- **Desarrollador Principal**: Rafael Carbonell Lázaro (racarla96)
-- **Proyecto**: Caddy AI2 - Proyecto CERVAREC
-
-## 📄 Licencia
-
-Copyright (c) 2025, Rafael Carbonell Lázaro (racarla96)
-
-Este proyecto se distribuye bajo la licencia **Creative Commons Attribution 4.0 International (CC BY 4.0)**.
-
-### En resumen:
-
-✅ **Puedes:**
-- Usar, modificar y redistribuir la librería
-- Utilizarla en proyectos comerciales o privados
-- Crear trabajos derivados
-
-⚠️ **Debes:**
-- Mantener atribución al autor/proyecto (en documentación, créditos, "About" de la aplicación, etc.)
-- Indicar si se realizaron cambios
-- Proporcionar un enlace a la licencia
-
-❌ **No puedes:**
-- Imponer restricciones adicionales que impidan a otros ejercer los permisos que otorga la licencia
-
-### Texto legal completo:
-https://creativecommons.org/licenses/by/4.0/legalcode
-
-### Atribución sugerida:
-
-
-Este proyecto utiliza "caddy_ai2_ros2_control_system_steering_driver"
-desarrollado por Rafael Carbonell Lázaro (racarla96)
-Licencia: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+Copyright © 2025 Rafael Carbonell Lázaro (racarla96) — CC BY 4.0  
+https://creativecommons.org/licenses/by/4.0/

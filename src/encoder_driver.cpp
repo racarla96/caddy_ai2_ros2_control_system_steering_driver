@@ -1,197 +1,132 @@
 #include "caddy_ai2_ros2_control_system_steering_driver/encoder_driver.hpp"
-#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
+
+#include <chrono>
 #include <iostream>
 #include <thread>
 
-EncoderDriver::EncoderDriver(uint8_t node_id, const std::string& name)
-    : CANOpenDriver(node_id, name)
-    , absolute_position_(0)
-    , filtered_position_(0)
-    , encoder_ok_(false) {
-}
+using namespace dzcante020l080;
 
-// encoder_driver.cpp
-// ...
-bool EncoderDriver::initialize(SocketCANInterface* can_interface) {
-    can_interface_ = can_interface;
+// ── Constructor ──────────────────────────────────────────────────────────────
 
-    std::cout << "[" << name_ << "] Iniciando configuración encoder..." << std::endl;
+EncoderDriver::EncoderDriver(SocketCANInterface& can, uint8_t node_id)
+    : CANopenDriver(can, node_id)
+    , raw_position_(0)
+    , valid_(false)
+{}
 
-    // Reset de comunicación
-    if (!sendNMT(0x82)) {  // RESET_COMMUNICATION
-        std::cerr << "[" << name_ << "] Error enviando RESET_COMMUNICATION" << std::endl;
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
+bool EncoderDriver::configure()
+{
+    std::cout << "[EncoderDriver:" << static_cast<int>(node_id_)
+              << "] Iniciando configuración...\n";
+
+    // 1. Reset de comunicación
+    if (!send_nmt(NMT_RESET_COMMUNICATION)) {
+        std::cerr << "[EncoderDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT RESET_COMM\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_RESET_MS));
 
-    // Pre-Operational
-    if (!sendNMT(0x80)) {
-        std::cerr << "[" << name_ << "] Error enviando PRE_OPERATIONAL" << std::endl;
+    // 2. Entrar en PRE_OPERATIONAL para configurar vía SDO
+    if (!send_nmt(NMT_ENTER_PRE_OPERATIONAL)) {
+        std::cerr << "[EncoderDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT PRE_OP\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    nmt_state_ = NMTState::PRE_OPERATIONAL;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PREOP_MS));
+    nmt_state_ = NmtState::PRE_OPERATIONAL;
 
-    // Configurar PDOs y nodeguard
-    if (!configureTPDOs()) { // Llama al nuevo método configureTPDOs
-        std::cerr << "[" << name_ << "] Error configurando TPDOs encoder" << std::endl;
-        return false;
-    }
-    if (!configureNodeGuard()) {
-        std::cerr << "[" << name_ << "] Error configurando NodeGuard encoder" << std::endl;
+    // 3. Configurar TPDO1 (posición absoluta)
+    if (!configure_tpdo()) {
+        std::cerr << "[EncoderDriver:" << static_cast<int>(node_id_)
+                  << "] Error configurando TPDO1\n";
         return false;
     }
 
-    std::cout << "[" << name_ << "] Configuración completada" << std::endl;
+    // 4. Configurar NodeGuard
+    if (!configure_nodeguard()) {
+        std::cerr << "[EncoderDriver:" << static_cast<int>(node_id_)
+                  << "] Error configurando NodeGuard\n";
+        return false;
+    }
+
+    // 5. NMT START → el encoder pasa a OPERATIONAL y empieza a enviar TPDOs
+    if (!send_nmt(NMT_START_REMOTE_NODE)) {
+        std::cerr << "[EncoderDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT START\n";
+        return false;
+    }
+
+    nmt_state_ = NmtState::OPERATIONAL;
+    reset_watchdog();  // inicia el contador de 2 s para recibir el primer heartbeat
+
+    std::cout << "[EncoderDriver:" << static_cast<int>(node_id_)
+              << "] Configuración completada. NMT=OPERATIONAL\n";
     return true;
 }
-// ...
 
-// encoder_driver.cpp
-// ...
-bool EncoderDriver::configureTPDOs() {
-    // Deshabilitar TPDO1 para configuración (bit 31 a 1)
-    uint32_t tpdo1_cob_id_disable = 0x80000000 | (0x180 + node_id_);
-    if (!sendSDO(0x1800, 0x01, (uint8_t*)&tpdo1_cob_id_disable, 4, true)) {
-        std::cerr << "[" << name_ << "] Error deshabilitando TPDO1 para config" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+// ── Configuración (bloqueante, solo en configure()) ──────────────────────────
 
-    // Mapear TPDO1 (ejemplo: 0x6000:01 para posición absoluta)
-    // Número de objetos mapeados (0x1600:00)
-    uint8_t num_mapped_objects = 0;
-    if (!sendSDO(0x1600, 0x00, &num_mapped_objects, 1, true)) {
-        std::cerr << "[" << name_ << "] Error reseteando mapeo TPDO1" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+bool EncoderDriver::configure_tpdo()
+{
+    // TPDO1 — posición absoluta (encoder→master, cada SYNC)
+    // COB-ID = 0x180 + node_id  (standard CANopen TPDO1, a diferencia del motor AMC)
+    if (!send_sdo_write(SDO_IDX_TPDO1_COMM, SDO_SUB_PDO_COB_ID,
+                        COB_ENC_TPDO1_BASE + node_id_, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
-    // Mapear 0x6000:01 (posición absoluta, 32 bits)
-    uint32_t mapped_object_1 = 0x60000120; // Index: 0x6000, Subindex: 0x01, Size: 32 bits
-    if (!sendSDO(0x1600, 0x01, (uint8_t*)&mapped_object_1, 4, true)) {
-        std::cerr << "[" << name_ << "] Error mapeando objeto 1 TPDO1" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    num_mapped_objects = 1; // Un objeto mapeado
-    if (!sendSDO(0x1600, 0x00, &num_mapped_objects, 1, true)) {
-        std::cerr << "[" << name_ << "] Error configurando num objetos mapeados TPDO1" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Tipo de transmisión (0x1800:02) - 1 = síncrono (por SYNC)
-    uint8_t transmission_type = 0x01;
-    if (!sendSDO(0x1800, 0x02, &transmission_type, 1, true)) {
-        std::cerr << "[" << name_ << "] Error configurando tipo transmisión TPDO1" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Habilitar TPDO1 (COB-ID sin bit 31)
-    uint32_t tpdo1_cob_id_enable = (0x180 + node_id_);
-    if (!sendSDO(0x1800, 0x01, (uint8_t*)&tpdo1_cob_id_enable, 4, true)) {
-        std::cerr << "[" << name_ << "] Error habilitando TPDO1" << std::endl;
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Repetir para TPDO2 si es necesario, o si quieres mapear otra cosa
-    // Por ahora, solo configuramos TPDO1 para la posición.
-    // Si el encoder tiene un segundo TPDO para la misma posición,
-    // o para velocidad, etc., habría que mapearlo aquí.
-    // Basado en tu descripción original, TPDO1 y TPDO2 eran para "absolute encoder counts".
-    // Si son redundantes, puedes configurar TPDO2 de forma similar.
-    // Si TPDO2 es para otra cosa (ej. velocidad), el mapeo 0x6000:01 no sería correcto.
-    // Por simplicidad, de momento nos centramos en TPDO1.
-
-    std::cout << "[" << name_ << "] TPDOs configurados (0x180 + node_id)" << std::endl;
-    return true;
-}
-// ...
-
-bool EncoderDriver::configureNodeGuard() {
-    uint16_t guard_time = 200;
-    if (!sendSDO(0x100C, 0x00, (uint8_t*)&guard_time, 2, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    uint8_t life_time_factor = 15;
-    if (!sendSDO(0x100D, 0x00, &life_time_factor, 1, true)) {
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Tipo de transmisión: 1 = síncrono (cada SYNC dispara el TPDO)
+    if (!send_sdo_write(SDO_IDX_TPDO1_COMM, SDO_SUB_PDO_TRANSMISSION_TYPE,
+                        ENC_TPDO1_TRANSMISSION_TYPE, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
     return true;
 }
 
-bool EncoderDriver::startOperational() {
-    if (!sendNMT(0x01)) { // START_REMOTE_NODE
-        std::cerr << "[" << name_ << "] Error enviando START" << std::endl;
-        return false;
-    }
-    nmt_state_ = NMTState::OPERATIONAL;
-    resetTimeout(last_nodeguard_time_);
-    resetTimeout(last_heartbeat_time_);
-    resetTimeout(last_sample_time_);
+bool EncoderDriver::configure_nodeguard()
+{
+    // Guard time en milisegundos
+    if (!send_sdo_write(SDO_IDX_GUARD_TIME, SDO_SUB_GUARD_TIME,
+                        NODEGUARD_GUARD_TIME_MS, 2)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
 
-    std::cout << "[" << name_ << "] Encoder en estado OPERATIONAL" << std::endl;
+    // Life time factor: timeout = guard_time × life_factor ms
+    if (!send_sdo_write(SDO_IDX_LIFE_FACTOR, SDO_SUB_LIFE_FACTOR,
+                        NODEGUARD_LIFE_FACTOR, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(STARTUP_SLEEP_PDO_MS));
+
     return true;
 }
 
-void EncoderDriver::update() {
-    if (!isOperational()) return;
+// ── Procesado de frames ──────────────────────────────────────────────────────
 
-    // NodeGuard cada 200 ms
-    if (checkTimeout(last_nodeguard_time_, 200)) {
-        sendNodeGuard();
-        resetTimeout(last_nodeguard_time_);
-    }
+void EncoderDriver::process_frame(const can_frame& frame)
+{
+    // Eliminar el RTR flag para la comparación de COB-ID
+    const uint32_t bare_id = frame.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
+    const uint32_t nid = node_id_;
 
-    // Podrías hacer aquí filtrados o comprobaciones de coherencia
-    if (checkTimeout(last_sample_time_, 20)) { // ~50 Hz
-        // Filtro simple (ejemplo)
-        filtered_position_ = absolute_position_; // aquí puedes poner media o filtro
-        resetTimeout(last_sample_time_);
-    }
-}
-
-// encoder_driver.cpp
-void EncoderDriver::processCANFrame(const struct can_frame& frame) {
-    uint32_t cob_id = frame.can_id;
-    uint32_t id = static_cast<uint32_t>(node_id_);  // ⬅️ Añade esto
-
-    if (cob_id == (0x180 + id)) {  // ⬅️ Usa 'id' en vez de 'node_id_'
-        processTPDO1(frame);
-    } else if (cob_id == (0x280 + id)) {
-        processTPDO2(frame);
-    } else if (cob_id == (0x700 + id)) {
-        processNodeGuardResponse(frame);
+    if (bare_id == (COB_ENC_TPDO1_BASE + nid)) {
+        process_tpdo1(frame);
+    } else if (bare_id == (COB_NODEGUARD_BASE + nid)) {
+        // Solo procesar la respuesta del encoder (sin RTR flag)
+        if (!(frame.can_id & CAN_RTR_FLAG) && frame.can_dlc >= 1) {
+            process_nmt_heartbeat(frame.data[0]);
+        }
     }
 }
 
-void EncoderDriver::processTPDO1(const struct can_frame& frame) {
-    if (frame.can_dlc >= 4) {
-        absolute_position_ = frame.data[0] |
-                             (frame.data[1] << 8) |
-                             (frame.data[2] << 16) |
-                             (frame.data[3] << 24);
-        encoder_ok_ = true;
-    }
-}
+void EncoderDriver::process_tpdo1(const can_frame& frame)
+{
+    if (frame.can_dlc < 4) return;
 
-void EncoderDriver::processTPDO2(const struct can_frame& frame) {
-    // Si tienes redundancia o segunda lectura, podrías validar aquí
-    // De momento simplemente ignoramos o podríamos comprobar coherencia
-(void)frame;  // ⬅️ Añade esto para suprimir el warning
-}
+    raw_position_ = static_cast<int32_t>(
+        static_cast<uint32_t>(frame.data[0])         |
+        (static_cast<uint32_t>(frame.data[1]) <<  8) |
+        (static_cast<uint32_t>(frame.data[2]) << 16) |
+        (static_cast<uint32_t>(frame.data[3]) << 24));
 
-void EncoderDriver::processNodeGuardResponse(const struct can_frame& frame) {
-    if (frame.can_dlc >= 1) {
-        communication_ok_ = true;
-        resetTimeout(last_heartbeat_time_);
-    }
+    valid_ = true;  // primer TPDO1 válido recibido
 }

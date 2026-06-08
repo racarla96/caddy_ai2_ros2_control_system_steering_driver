@@ -1,107 +1,198 @@
 #include "caddy_ai2_ros2_control_system_steering_driver/canopen_driver.hpp"
-#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
+
 #include <cstring>
 #include <iostream>
+#include <vector>
 
-// Comandos NMT estándar
-#define NMT_START_REMOTE_NODE    0x01
-#define NMT_STOP_REMOTE_NODE     0x02
-#define NMT_ENTER_PRE_OPERATIONAL 0x80
-#define NMT_RESET_NODE           0x81
-#define NMT_RESET_COMMUNICATION  0x82
+using namespace dzcante020l080;
 
-CANOpenDriver::CANOpenDriver(uint8_t node_id, const std::string& name)
-    : node_id_(node_id)
-    , name_(name)
-    , nmt_state_(NMTState::BOOT_UP)
-    , can_interface_(nullptr)
-    , communication_ok_(false) {
+// ── Constructor ──────────────────────────────────────────────────────────────
+
+CANopenDriver::CANopenDriver(SocketCANInterface& can, uint8_t node_id)
+    : can_(can)
+    , node_id_(node_id)
+    , nmt_state_(NmtState::UNKNOWN)
+    , nodeguard_elapsed_(0.0)
+    , watchdog_elapsed_(0.0)
+{}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
+bool CANopenDriver::configure()
+{
+    return true;
 }
 
-bool CANOpenDriver::sendNMT(uint8_t command) {
-    if (!can_interface_) return false;
+void CANopenDriver::shutdown() {}
 
-    struct can_frame frame;
-    frame.can_id = 0x000;  // NMT COB-ID
+// ── Métodos cíclicos (sin sleeps) ────────────────────────────────────────────
+
+void CANopenDriver::update(double dt)
+{
+    // NodeGuard: enviar RTR periódicamente para mantener la supervisión del drive
+    nodeguard_elapsed_ += dt;
+    if (nodeguard_elapsed_ >= NODEGUARD_PERIOD_S) {
+        send_nodeguard_rtr();
+        nodeguard_elapsed_ = 0.0;
+    }
+
+    // Watchdog NMT: declarar FAULT si el drive no responde en NMT_TIMEOUT_S
+    // reset_watchdog() se llama desde process_nmt_heartbeat() al recibir OPERATIONAL
+    watchdog_elapsed_ += dt;
+    if (watchdog_elapsed_ >= NMT_TIMEOUT_S) {
+        nmt_state_ = NmtState::FAULT;
+    }
+}
+
+void CANopenDriver::receive_frames()
+{
+    std::vector<can_frame> frames;
+    // timeout_ms = 0: no bloqueante, devuelve inmediatamente los frames disponibles
+    can_.read(frames, nullptr, 0);
+    for (const auto& frame : frames) {
+        process_frame(frame);
+    }
+}
+
+// ── Primitivas de comunicación ───────────────────────────────────────────────
+
+void CANopenDriver::send_sync()
+{
+    can_frame frame{};
+    frame.can_id  = COB_SYNC;
+    frame.can_dlc = 0;
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando SYNC\n";
+    }
+}
+
+bool CANopenDriver::send_nmt(uint8_t command)
+{
+    can_frame frame{};
+    frame.can_id  = COB_NMT_REQUEST;
     frame.can_dlc = 2;
     frame.data[0] = command;
     frame.data[1] = node_id_;
-
-    return can_interface_->write(frame);
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NMT cmd=0x" << std::hex << static_cast<int>(command)
+                  << std::dec << '\n';
+        return false;
+    }
+    return true;
 }
 
-bool CANOpenDriver::sendSDO(uint16_t index, uint8_t subindex, const uint8_t* data, uint8_t data_len, bool write) {
-    if (!can_interface_) return false;
-
-    struct can_frame frame;
-    frame.can_id = 0x600 + node_id_;  // SDO Request COB-ID
+bool CANopenDriver::send_sdo_write(uint16_t index, uint8_t subindex,
+                                   uint32_t value, uint8_t size)
+{
+    can_frame frame{};
+    frame.can_id  = COB_SDO_REQUEST_BASE + node_id_;
     frame.can_dlc = 8;
 
-    if (write) {
-        // SDO Download (write)
-        frame.data[0] = 0x23;  // Command byte: download, 4 bytes
-        frame.data[1] = index & 0xFF;
-        frame.data[2] = (index >> 8) & 0xFF;
-        frame.data[3] = subindex;
-        memcpy(&frame.data[4], data, std::min(data_len, (uint8_t)4));
-    } else {
-        // SDO Upload (read)
-        frame.data[0] = 0x40;  // Command byte: upload request
-        frame.data[1] = index & 0xFF;
-        frame.data[2] = (index >> 8) & 0xFF;
-        frame.data[3] = subindex;
-        memset(&frame.data[4], 0, 4);
+    // Byte de comando según número de bytes de datos útiles
+    uint8_t cmd;
+    switch (size) {
+        case 1:  cmd = SDO_CMD_WRITE_1B; break;
+        case 2:  cmd = SDO_CMD_WRITE_2B; break;
+        default: cmd = SDO_CMD_WRITE_4B; break;  // 4 bytes por defecto
     }
 
-    return can_interface_->write(frame);
-}
+    frame.data[0] = cmd;
+    frame.data[1] = static_cast<uint8_t>(index & 0xFFU);
+    frame.data[2] = static_cast<uint8_t>((index >> 8) & 0xFFU);
+    frame.data[3] = subindex;
+    // Datos en little-endian, bytes no usados quedan a 0 (frame{} los inicializa)
+    frame.data[4] = static_cast<uint8_t>(value & 0xFFU);
+    frame.data[5] = static_cast<uint8_t>((value >>  8) & 0xFFU);
+    frame.data[6] = static_cast<uint8_t>((value >> 16) & 0xFFU);
+    frame.data[7] = static_cast<uint8_t>((value >> 24) & 0xFFU);
 
-bool CANOpenDriver::sendPDO(uint16_t cob_id, const uint8_t* data, uint8_t data_len) {
-    if (!can_interface_) return false;
-
-    struct can_frame frame;
-    frame.can_id = cob_id;
-    frame.can_dlc = data_len;
-    memcpy(frame.data, data, data_len);
-
-    return can_interface_->write(frame);
-}
-
-bool CANOpenDriver::sendSync() {
-    if (!can_interface_) return false;
-
-    struct can_frame frame;
-    frame.can_id = 0x80;  // SYNC COB-ID
-    frame.can_dlc = 0;
-
-    return can_interface_->write(frame);
-}
-
-bool CANOpenDriver::sendNodeGuard() {
-    if (!can_interface_) return false;
-
-    struct can_frame frame;
-    frame.can_id = 0x700 + node_id_;  // Node Guard COB-ID
-    frame.can_dlc = 1;
-    frame.data[0] = 0x00;  // RTR flag se maneja diferente en SocketCAN
-
-    return can_interface_->write(frame);
-}
-
-void CANOpenDriver::buildCANFrame(struct can_frame& frame, uint32_t can_id, const uint8_t* data, uint8_t len) {
-    frame.can_id = can_id;
-    frame.can_dlc = len;
-    if (data && len > 0) {
-        memcpy(frame.data, data, std::min(len, (uint8_t)8));
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error SDO write idx=0x" << std::hex << index
+                  << " sub=0x" << static_cast<int>(subindex) << std::dec << '\n';
+        return false;
     }
+    return true;
 }
 
-bool CANOpenDriver::checkTimeout(std::chrono::steady_clock::time_point& last_time, int timeout_ms) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
-    return elapsed >= timeout_ms;
+bool CANopenDriver::send_sdo_read(uint16_t index, uint8_t subindex)
+{
+    can_frame frame{};
+    frame.can_id  = COB_SDO_REQUEST_BASE + node_id_;
+    frame.can_dlc = 8;
+    frame.data[0] = SDO_CMD_READ_REQ;   // 0x40 = upload initiate
+    frame.data[1] = static_cast<uint8_t>(index & 0xFFU);
+    frame.data[2] = static_cast<uint8_t>((index >> 8) & 0xFFU);
+    frame.data[3] = subindex;
+    // data[4..7] ya son 0 por frame{}
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error SDO read idx=0x" << std::hex << index
+                  << " sub=0x" << static_cast<int>(subindex) << std::dec << '\n';
+        return false;
+    }
+    return true;
 }
 
-void CANOpenDriver::resetTimeout(std::chrono::steady_clock::time_point& time_point) {
-    time_point = std::chrono::steady_clock::now();
+bool CANopenDriver::send_pdo(uint16_t cob_id, const uint8_t* data, uint8_t len)
+{
+    can_frame frame{};
+    frame.can_id  = cob_id;
+    frame.can_dlc = (len <= 8) ? len : 8;
+    if (data != nullptr && frame.can_dlc > 0) {
+        std::memcpy(frame.data, data, frame.can_dlc);
+    }
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando PDO cob=0x" << std::hex << cob_id << std::dec << '\n';
+        return false;
+    }
+    return true;
+}
+
+bool CANopenDriver::send_nodeguard_rtr()
+{
+    can_frame frame{};
+    // CAN_RTR_FLAG en can_id indica Remote Transmission Request — crítico para NodeGuard
+    frame.can_id  = (COB_NODEGUARD_BASE + node_id_) | CAN_RTR_FLAG;
+    frame.can_dlc = 1;  // el drive responde con 1 byte de estado NMT
+    if (can_.write(frame) != SocketCANInterface::Status::Ok) {
+        std::cerr << "[CANopenDriver:" << static_cast<int>(node_id_)
+                  << "] Error enviando NodeGuard RTR\n";
+        return false;
+    }
+    return true;
+}
+
+// ── Watchdog y heartbeat ─────────────────────────────────────────────────────
+
+void CANopenDriver::reset_watchdog()
+{
+    watchdog_elapsed_ = 0.0;
+}
+
+void CANopenDriver::process_nmt_heartbeat(uint8_t state_byte)
+{
+    // Decodifica el byte de estado del NodeGuard response / NMT heartbeat.
+    // El toggle-bit (bit 7) alterna en cada respuesta: se manejan ambas variantes.
+    switch (state_byte) {
+        case NMT_HB_OPERATIONAL_0:
+        case NMT_HB_OPERATIONAL_1:
+            nmt_state_ = NmtState::OPERATIONAL;
+            reset_watchdog();  // drive vivo: reiniciar temporizador de fallo
+            break;
+        case NMT_HB_STOPPED_0:
+        case NMT_HB_STOPPED_1:
+            nmt_state_ = NmtState::STOPPED;
+            break;
+        case NMT_HB_PRE_OPERATIONAL_0:
+        case NMT_HB_PRE_OPERATIONAL_1:
+            nmt_state_ = NmtState::PRE_OPERATIONAL;
+            break;
+        default:
+            // Byte desconocido: ignorar sin cambiar estado
+            break;
+    }
 }

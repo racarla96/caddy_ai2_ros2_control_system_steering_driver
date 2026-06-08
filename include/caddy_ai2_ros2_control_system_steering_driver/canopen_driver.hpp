@@ -1,64 +1,98 @@
 #pragma once
 
-#include <linux/can.h>
 #include <cstdint>
-#include <string>
-#include <chrono>
+#include <linux/can.h>
 
-#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
+#include "caddy_ai2_ros2_control_system_steering_driver/socket_can_interface.hpp"
+#include "caddy_ai2_ros2_control_system_steering_driver/dzcante020l080_constants.hpp"
 
-class SocketCANInterface;
-
-// Estados NMT de CANopen
-enum class NMTState {
-    BOOT_UP,
-    STOPPED,
+// Estados NMT del nodo CANopen
+enum class NmtState {
+    UNKNOWN,
+    PRE_OPERATIONAL,
     OPERATIONAL,
-    PRE_OPERATIONAL
+    STOPPED,
+    FAULT
 };
 
-// Clase base para dispositivos CANopen
-class CANOpenDriver {
+// ============================================================================
+// CANopenDriver — clase base para dispositivos CANopen
+//
+// Gestiona el watchdog NMT y el NodeGuard periódico.
+// No contiene lógica de ROS, ni hilos, ni sleeps en métodos cíclicos.
+// Los sleeps están reservados para configure() / shutdown().
+// ============================================================================
+class CANopenDriver
+{
 public:
-    CANOpenDriver(uint8_t node_id, const std::string& name);
-    virtual ~CANOpenDriver() = default;
+    explicit CANopenDriver(SocketCANInterface& can, uint8_t node_id);
+    virtual ~CANopenDriver() = default;
 
-    // Métodos virtuales puros que deben implementar las clases derivadas
-    virtual bool initialize(SocketCANInterface* can_interface) = 0;
-    virtual bool startOperational() = 0;
-    virtual void update() = 0;  // Llamado en cada ciclo del loop principal
-    virtual void processCANFrame(const struct can_frame& frame) = 0;
+    // Secuencia de arranque bloqueante (solo se llama desde on_configure, nunca
+    // desde el bucle de control). Las subclases sobreescriben este método.
+    virtual bool configure();
 
-    // Getters
-    uint8_t getNodeId() const { return node_id_; }
-    const std::string& getName() const { return name_; }
-    NMTState getNMTState() const { return nmt_state_; }
-    bool isOperational() const { return nmt_state_ == NMTState::OPERATIONAL; }
+    // Apagado del nodo. Las subclases sobreescriben si necesitan acciones extra.
+    virtual void shutdown();
 
-    bool sendSync();
+    // Bucle cíclico no bloqueante: actualiza watchdog NMT + NodeGuard periódico.
+    // NO contiene sleeps. Se llama desde cycle_read() de SteeringController.
+    virtual void update(double dt);
+
+    // Drain no bloqueante del bus CAN. Pasa cada frame a process_frame().
+    // Se usa en modo standalone; en SteeringController el routing lo hace el SC.
+    void receive_frames();
+
+    // Envía un frame SYNC (COB-ID 0x080, DLC=0).
+    void send_sync();
+
+    NmtState get_nmt_state() const { return nmt_state_; }
+    bool     is_communication_ok() const { return nmt_state_ == NmtState::OPERATIONAL; }
+    uint8_t  get_node_id() const { return node_id_; }
+
+    // Punto de entrada público para que SteeringController enrute frames a este driver.
+    // Cada subclase filtra internamente por su node_id en process_frame() (protected).
+    void dispatch_frame(const can_frame& frame) { process_frame(frame); }
 
 protected:
-    // Métodos auxiliares para comunicación CANopen
-    bool sendNMT(uint8_t command);
-    bool sendSDO(uint16_t index, uint8_t subindex, const uint8_t* data, uint8_t data_len, bool write = true);
-    bool sendPDO(uint16_t cob_id, const uint8_t* data, uint8_t data_len);
-    bool sendNodeGuard();
+    // ── Primitivas de comunicación ──────────────────────────────────────────
 
-    // Utilidades para construcción de mensajes
-    void buildCANFrame(struct can_frame& frame, uint32_t can_id, const uint8_t* data, uint8_t len);
-    
-    // Gestión de timeouts
-    bool checkTimeout(std::chrono::steady_clock::time_point& last_time, int timeout_ms);
-    void resetTimeout(std::chrono::steady_clock::time_point& time_point);
+    // Envía un comando NMT (frame 0x000, 2 bytes: [command, node_id])
+    bool send_nmt(uint8_t command);
 
-    // Miembros protegidos
-    uint8_t node_id_;
-    std::string name_;
-    NMTState nmt_state_;
-    SocketCANInterface* can_interface_;
-    
-    // Timeouts
-    std::chrono::steady_clock::time_point last_nodeguard_time_;
-    std::chrono::steady_clock::time_point last_heartbeat_time_;
-    bool communication_ok_;
+    // SDO expedited download (write al drive). size: 1, 2 o 4 bytes.
+    // Los bytes no usados de data[4..7] se rellenan con 0.
+    bool send_sdo_write(uint16_t index, uint8_t subindex, uint32_t value, uint8_t size);
+
+    // SDO upload initiate (read del drive). La respuesta llega en el siguiente
+    // drain de frames y debe procesarse en process_sdo_response() de la subclase.
+    bool send_sdo_read(uint16_t index, uint8_t subindex);
+
+    // Envía un PDO (frame CAN arbitrario con los datos indicados)
+    bool send_pdo(uint16_t cob_id, const uint8_t* data, uint8_t len);
+
+    // NodeGuard RTR: frame con can_id = (0x700+node_id) | CAN_RTR_FLAG
+    // El drive responde con su estado NMT en un byte (process_nmt_heartbeat)
+    bool send_nodeguard_rtr();
+
+    // Reinicia el contador del watchdog NMT. Se llama desde process_nmt_heartbeat
+    // cada vez que el drive confirma estar en OPERATIONAL.
+    void reset_watchdog();
+
+    // Decodifica el byte de estado del heartbeat / NodeGuard response y actualiza
+    // nmt_state_. Llama a reset_watchdog() cuando el drive está OPERATIONAL.
+    void process_nmt_heartbeat(uint8_t state_byte);
+
+    // Procesa un frame CAN recibido. Las subclases filtran por su node_id.
+    // Deben llamar a process_nmt_heartbeat() cuando detecten COB_NODEGUARD_BASE+node_id_.
+    virtual void process_frame(const can_frame& frame) = 0;
+
+    // ── Miembros compartidos con subclases ─────────────────────────────────
+    SocketCANInterface& can_;
+    uint8_t   node_id_;
+    NmtState  nmt_state_;
+
+private:
+    double nodeguard_elapsed_;   // segundos desde el último NodeGuard RTR
+    double watchdog_elapsed_;    // segundos desde el último heartbeat OPERATIONAL
 };
