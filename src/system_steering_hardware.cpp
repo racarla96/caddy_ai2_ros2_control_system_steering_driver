@@ -1,5 +1,6 @@
 #include "caddy_ai2_ros2_control_system_steering_driver/system_steering_hardware.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -159,8 +160,9 @@ hardware_interface::CallbackReturn SystemSteeringHardware::on_init(
   effective_read_multiplicity_  = read_multiplicity_  * frequency_ratio;
   effective_write_multiplicity_ = write_multiplicity_ * frequency_ratio;
 
-  read_counter_  = 0;
-  write_counter_ = 0;
+  read_counter_       = 0;
+  write_counter_      = 0;
+  motor_count_offset_ = 0;
 
   hw_states_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   hw_commands_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
@@ -263,7 +265,9 @@ hardware_interface::CallbackReturn SystemSteeringHardware::on_activate(
   write_counter_ = effective_write_multiplicity_ - write_offset_;
 
   // Inicializar estado con la posición actual
-  const double init_rad = feedback_to_rad(steering_controller_->get_position());
+  const double  init_rad            = feedback_to_rad(steering_controller_->get_position());
+  const int32_t actual_motor_counts = steering_controller_->get_motor_position();
+  motor_count_offset_ = actual_motor_counts - rad_to_motor_counts(init_rad);
   hw_states_[0] = init_rad;
   for (size_t i = 0; i < hw_commands_.size(); ++i) {
     if (std::isnan(hw_commands_[i])) {
@@ -272,10 +276,11 @@ hardware_interface::CallbackReturn SystemSteeringHardware::on_activate(
   }
 
   RCLCPP_INFO(logger, "on_activate OK — posición inicial: %.4f rad  "
-                      "(raw=%d  counts_motor=%d)",
+                      "(raw=%d  motor_counts=%d  offset=%d)",
               init_rad,
               steering_controller_->get_position(),
-              rad_to_motor_counts(init_rad));
+              actual_motor_counts,
+              motor_count_offset_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -347,7 +352,8 @@ hardware_interface::return_type SystemSteeringHardware::write(
   write_counter_ = 0;
 
   if (!std::isnan(hw_commands_[0])) {
-    steering_controller_->set_target_position(rad_to_motor_counts(hw_commands_[0]));
+    const double cmd = std::clamp(hw_commands_[0], -steering_angle_range_, steering_angle_range_);
+    steering_controller_->set_target_position(rad_to_motor_counts(cmd) + motor_count_offset_);
     steering_controller_->cycle_write();
   }
 

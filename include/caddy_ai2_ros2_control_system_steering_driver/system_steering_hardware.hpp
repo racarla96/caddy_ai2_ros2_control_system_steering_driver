@@ -121,6 +121,13 @@ private:
   std::vector<double> hw_states_;    // [0] = posición (rad)
   std::vector<double> hw_commands_;  // [0] = posición objetivo (rad)
 
+  // ── Offset entre el encoder relativo del motor y el espacio de calibración ─
+  // Calculado en on_activate() a partir de la lectura inicial del sensor
+  // absoluto. Se aplica en write() para corregir que el motor arranca en 0
+  // independientemente de la posición física real del volante.
+  // offset = actual_motor_counts − rad_to_motor_counts(init_rad_from_sensor)
+  int32_t motor_count_offset_;
+
   // ── Driver ────────────────────────────────────────────────────────────────
   std::unique_ptr<SteeringController> steering_controller_;
 };
