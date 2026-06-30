@@ -2,6 +2,10 @@
 
 Plugin de tipo **Controller** (`controller_interface::ControllerInterface`) para ROS2 Control que gestiona el sistema de dirección del robot Caddy AI2 mediante CANopen sobre SocketCAN.
 
+> **Documentación adicional:**  
+> - [install/README.md](install/README.md) — instalación de drivers y configuración CAN  
+> - [test/README.md](test/README.md) — tests standalone sin ROS (calibración POT y EPC)
+
 ## Descripción
 
 Este paquete implementa un **Controller** de ROS2 Control que sustituye a la antigua arquitectura basada en Hardware Interface. El controlador gestiona directamente la comunicación CAN/CANopen sin necesidad de un hardware interface separado:

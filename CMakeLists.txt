@@ -80,10 +80,28 @@ install(
   RUNTIME DESTINATION bin
 )
 
+install(
+  DIRECTORY install/scripts
+  DESTINATION share/${PROJECT_NAME}
+)
+
 # Install scripts with executable permissions
 install(PROGRAMS
-  scripts/setup_can_steer_drv.sh
-  scripts/setup_vcan_steer_drv.sh
+  install/scripts/setup_ixxat_usb_can_steer_drv.sh
+  install/scripts/setup_vcan_steer_drv.sh
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+## Tests standalone — sin dependencias de ROS
+# Todos enlazan contra ${PROJECT_NAME} que trae transitivamente caddy_ai2_ros2_common::socketcan_interface
+foreach(TEST_NAME test_standalone test_sinusoidal test_passive test_calibration test_calibration_epc)
+  add_executable(${TEST_NAME} test/${TEST_NAME}.cpp)
+  target_include_directories(${TEST_NAME} PRIVATE
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+  target_link_libraries(${TEST_NAME} ${PROJECT_NAME})
+endforeach()
+
+install(TARGETS test_standalone test_sinusoidal test_passive test_calibration test_calibration_epc
   DESTINATION lib/${PROJECT_NAME}
 )
 
