@@ -21,11 +21,17 @@ public:
     // Interface sencilla para comandos
     void setTargetSteeringPosition(int32_t position_counts);
 
-// Posición del encoder del drive (MotorDriver)
+    // Posición del encoder del drive (MotorDriver)
     int32_t getMotorEncoderPosition() const;
 
     // Posición del encoder absoluto externo (EncoderDriver)
     int32_t getAbsoluteEncoderPosition() const;
+
+    // Diagnóstico
+    bool isMotorEnabled() const { return motor_.isEnabled(); }
+    bool hasFault() const { return motor_.getMotorState() == MotorState::FAULT; }
+    NMTState getMotorNMTState() const { return motor_.getNMTState(); }
+    MotorState getMotorState() const { return motor_.getMotorState(); }
 
 private:
     void processIncomingCAN();  // leer frames y enrutar a motor/encoder

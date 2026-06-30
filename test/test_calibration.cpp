@@ -24,7 +24,7 @@
 
 #include <linux/can.h>
 
-#include "caddy_ai2_ros2_control_system_steering_driver/socket_can_interface.hpp"
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
@@ -61,12 +61,13 @@ struct Regression {
 
     bool fit(double& a, double& b, double& r) const {
         if (n < 2) return false;
-        const double den = n * sxx - sx * sx;
+        const double dn  = static_cast<double>(n);
+        const double den = dn * sxx - sx * sx;
         if (std::abs(den) < 1e-9) return false;
-        a = (n * sxy - sx * sy) / den;
-        b = (sy - a * sx) / n;
-        const double rn  = n * sxy - sx * sy;
-        const double rd  = std::sqrt((n * sxx - sx * sx) * (n * syy - sy * sy));
+        a = (dn * sxy - sx * sy) / den;
+        b = (sy - a * sx) / dn;
+        const double rn  = dn * sxy - sx * sy;
+        const double rd  = std::sqrt((dn * sxx - sx * sx) * (dn * syy - sy * sy));
         r = (rd > 1e-9) ? rn / rd : 0.0;
         return true;
     }
@@ -155,7 +156,7 @@ int main(int argc, char* argv[])
 
         // Drain
         std::vector<can_frame> frames;
-        can.read(frames, nullptr, 5);
+        can.read(frames, 5);
 
         for (const auto& fr : frames) {
             const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);

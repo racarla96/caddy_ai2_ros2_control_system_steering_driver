@@ -30,7 +30,7 @@
 
 #include <linux/can.h>
 
-#include "caddy_ai2_ros2_control_system_steering_driver/socket_can_interface.hpp"
+#include "caddy_ai2_ros2_common/socket_can_interface.hpp"
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
@@ -152,7 +152,7 @@ int main(int argc, char* argv[])
         }
 
         std::vector<can_frame> frames;
-        can.read(frames, nullptr, 5);
+        can.read(frames, 5);
 
         for (const auto& fr : frames) {
             const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
