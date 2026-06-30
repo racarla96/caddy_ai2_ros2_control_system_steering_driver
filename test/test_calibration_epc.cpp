@@ -35,11 +35,11 @@
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
 
-static constexpr uint32_t COB_NMT          = 0x000U;
-static constexpr uint32_t COB_SYNC         = 0x080U;
-static constexpr uint32_t COB_SDO_REQ_BASE = 0x600U;
-static constexpr uint32_t COB_TPDO21_BASE  = 0x400U;  // motor ActualPosition
-static constexpr uint32_t COB_ENC_TPDO1_BASE = 0x180U;  // encoder position
+static constexpr uint32_t COB_NMT            = 0x000U;
+static constexpr uint32_t COB_SYNC           = 0x080U;
+static constexpr uint32_t COB_SDO_REQ_BASE   = 0x600U;
+static constexpr uint32_t COB_TPDO21_BASE    = 0x400U;   // motor ActualPosition
+static constexpr uint32_t COB_ENC_TPDO1_BASE = 0x180U;   // encoder position
 static constexpr uint16_t SDO_IDX_TPDO1_COMM = 0x1800U;
 
 static void send_nmt(SocketCANInterface& can, uint8_t cmd, uint8_t node_id)
@@ -69,6 +69,42 @@ static void send_sdo_write(SocketCANInterface& can, uint8_t node_id,
     can.write(f);
 }
 
+// Drena todos los frames disponibles. Llama varias veces para capturar frames
+// que llegan con distinto retardo tras el SYNC.
+static int drain_frames(SocketCANInterface& can, std::vector<can_frame>& out,
+                        int total_ms, int slice_ms = 3)
+{
+    int total = 0;
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(total_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::vector<can_frame> batch;
+        int n = can.read(batch, slice_ms);
+        if (n > 0) {
+            out.insert(out.end(), batch.begin(), batch.end());
+            total += n;
+        }
+    }
+    return total;
+}
+
+static void print_frame_raw(const can_frame& fr)
+{
+    const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
+    std::cout << "    0x" << std::hex << std::setw(3) << std::setfill('0') << id
+              << std::dec << std::setfill(' ')
+              << "  dlc=" << static_cast<int>(fr.can_dlc) << "  [";
+    for (int i = 0; i < 8; ++i) {
+        if (i < fr.can_dlc)
+            std::cout << std::hex << std::setw(2) << std::setfill('0')
+                      << static_cast<int>(fr.data[i]);
+        else
+            std::cout << "--";
+        if (i < 7) std::cout << " ";
+    }
+    std::cout << std::dec << std::setfill(' ') << "]\n";
+}
+
 int main(int argc, char* argv[])
 {
     const std::string can_iface  = (argc > 1) ? argv[1] : "vcan0";
@@ -78,10 +114,15 @@ int main(int argc, char* argv[])
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    const uint32_t expected_motor_cob = COB_TPDO21_BASE    + motor_id;
+    const uint32_t expected_enc_cob   = COB_ENC_TPDO1_BASE + encoder_id;
+
     std::cout << "=== Calibración Encoder EPC ===\n"
               << "  CAN        : " << can_iface << "\n"
-              << "  motor_id   : " << static_cast<int>(motor_id) << "\n"
-              << "  encoder_id : " << static_cast<int>(encoder_id) << "\n\n"
+              << "  motor_id   : " << static_cast<int>(motor_id)
+              << "  (TPDO21 COB-ID=0x" << std::hex << expected_motor_cob << std::dec << ")\n"
+              << "  encoder_id : " << static_cast<int>(encoder_id)
+              << "  (TPDO1  COB-ID=0x" << std::hex << expected_enc_cob  << std::dec << ")\n\n"
               << "  PASO 1: Asegúrate de que la rueda está RECTA (posición 0).\n"
               << "          El primer valor válido se registrará como zero.\n"
               << "  PASO 2: Mueve la rueda lentamente entre los dos límites físicos.\n"
@@ -93,23 +134,81 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // Configurar TPDO1 del encoder (COB-ID + tipo transmisión síncrona)
+    // ── Configurar TPDO1 del encoder ────────────────────────────────────────────
     std::cout << "[cfg] Configurando encoder TPDO1...\n";
-    send_nmt(can, 0x82U, encoder_id);  // RESET_COMM solo al encoder
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    send_nmt(can, 0x80U, encoder_id);  // PRE_OP solo al encoder
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    send_sdo_write(can, encoder_id, SDO_IDX_TPDO1_COMM, 0x01,
-                   COB_ENC_TPDO1_BASE + encoder_id, 4);  // COB-ID
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    send_sdo_write(can, encoder_id, SDO_IDX_TPDO1_COMM, 0x02, 1, 1);  // trans=SYNC
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // NMT START broadcast: motor y encoder pasan a OPERATIONAL y emiten TPDOs
-    send_nmt(can, 0x01U, 0x00U);
+    send_nmt(can, 0x82U, encoder_id);   // RESET_COMM al encoder
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    send_nmt(can, 0x80U, encoder_id);   // PRE_OP al encoder
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Primero deshabilitar el TPDO (bit31=1) antes de cambiar COB-ID (CiA301 §7.2.4)
+    send_sdo_write(can, encoder_id, SDO_IDX_TPDO1_COMM, 0x01,
+                   (COB_ENC_TPDO1_BASE + encoder_id) | 0x80000000UL, 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Poner nuevo COB-ID habilitado (bit31=0)
+    send_sdo_write(can, encoder_id, SDO_IDX_TPDO1_COMM, 0x01,
+                   COB_ENC_TPDO1_BASE + encoder_id, 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Tipo de transmisión = 1 (sincrónico: enviar tras cada SYNC)
+    send_sdo_write(can, encoder_id, SDO_IDX_TPDO1_COMM, 0x02, 1U, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // NMT START broadcast
+    send_nmt(can, 0x01U, 0x00U);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     std::cout << "[cfg] OK\n\n";
 
+    // ── Diagnóstico: escuchar el bus durante 2 s sin SYNC ───────────────────────
+    std::cout << "[diag] Escuchando bus 2 s (sin SYNC) — frames recibidos:\n";
+    {
+        std::vector<can_frame> diag;
+        drain_frames(can, diag, 2000, 10);
+        if (diag.empty()) {
+            std::cout << "  (ninguno)\n";
+        } else {
+            for (const auto& fr : diag) {
+                const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
+                std::string label;
+                if (id == expected_motor_cob)       label = " ← TPDO21 motor";
+                else if (id == expected_enc_cob)    label = " ← TPDO1  encoder";
+                else if (id == (0x700U + motor_id)) label = " ← NMT motor";
+                else if (id == (0x700U + encoder_id)) label = " ← NMT encoder";
+                print_frame_raw(fr);
+                if (!label.empty()) std::cout << "          " << label << "\n";
+            }
+        }
+    }
+    std::cout << "\n";
+
+    // Si el encoder envía en modo asíncrono (sin SYNC), avisamos
+    // pero continuamos con SYNC para el logging correlacionado.
+
+    // ── Diagnóstico: un ciclo de SYNC y ver qué responde ────────────────────────
+    std::cout << "[diag] Enviando 5 SYNCs de prueba:\n";
+    for (int i = 0; i < 5 && g_running; ++i) {
+        can_frame sync{};
+        sync.can_id  = COB_SYNC;
+        sync.can_dlc = 0;
+        can.write(sync);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));  // dar tiempo al encoder
+
+        std::vector<can_frame> batch;
+        drain_frames(can, batch, 15, 3);  // 15 ms de ventana
+        for (const auto& fr : batch) {
+            const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
+            std::string label;
+            if (id == expected_motor_cob)       label = " ← TPDO21 motor";
+            else if (id == expected_enc_cob)    label = " ← TPDO1  encoder";
+            else if (id == (0x700U + motor_id)) label = " ← NMT motor";
+            else if (id == (0x700U + encoder_id)) label = " ← NMT encoder";
+            print_frame_raw(fr);
+            if (!label.empty()) std::cout << "          " << label << "\n";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    std::cout << "\n";
+
+    // ── Calibración ─────────────────────────────────────────────────────────────
     std::cout << std::left
               << std::setw(12) << "motor_pos"
               << std::setw(12) << "enc_pos"
@@ -138,7 +237,8 @@ int main(int argc, char* argv[])
     int32_t enc_at_min_motor = 0;
     int64_t n_samples        = 0;
 
-    int cycle = 0;
+    int cycle         = 0;
+    int unknown_count = 0;
 
     while (g_running) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -151,23 +251,31 @@ int main(int argc, char* argv[])
             can.write(f);
         }
 
+        // Esperar 10 ms para que TODOS los dispositivos respondan al SYNC
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // Drenar todo lo que haya en el buffer
         std::vector<can_frame> frames;
-        can.read(frames, 5);
+        drain_frames(can, frames, 5, 2);
 
         for (const auto& fr : frames) {
             const uint32_t id = fr.can_id & ~static_cast<uint32_t>(CAN_RTR_FLAG);
 
-            if (id == static_cast<uint32_t>(COB_TPDO21_BASE + motor_id) && fr.can_dlc >= 4) {
+            if (id == expected_motor_cob && fr.can_dlc >= 4) {
                 std::memcpy(&cur_motor, fr.data, 4);
                 motor_ok = true;
-            } else if (id == static_cast<uint32_t>(COB_ENC_TPDO1_BASE + encoder_id)
-                       && fr.can_dlc >= 4) {
+            } else if (id == expected_enc_cob && fr.can_dlc >= 4) {
                 cur_enc = static_cast<int32_t>(
                     static_cast<uint32_t>(fr.data[0])          |
                     (static_cast<uint32_t>(fr.data[1]) <<  8)  |
                     (static_cast<uint32_t>(fr.data[2]) << 16)  |
                     (static_cast<uint32_t>(fr.data[3]) << 24));
                 enc_ok = true;
+            } else if (id != COB_SYNC && id != (0x700U + motor_id)
+                       && id != (0x700U + encoder_id)
+                       && id != (0x580U + motor_id)
+                       && id != (0x580U + encoder_id)) {
+                ++unknown_count;
             }
         }
 
@@ -176,7 +284,7 @@ int main(int argc, char* argv[])
                 zero_motor = cur_motor;
                 zero_enc   = cur_enc;
                 zero_set   = true;
-                std::cout << "[zero] Referencia 0 rad capturada:"
+                std::cout << "\n[zero] Referencia 0 rad capturada:"
                           << "  motor_pos=" << zero_motor
                           << "  enc_pos=" << zero_enc << "\n\n";
             }
@@ -190,19 +298,21 @@ int main(int argc, char* argv[])
 
         ++cycle;
 
-        if (cycle % 10 == 0 && motor_ok && enc_ok) {
+        // Resumen cada 10 ciclos (~200 ms)
+        if (cycle % 10 == 0) {
             std::cout << "\r" << std::left
-                      << std::setw(12) << cur_motor
-                      << std::setw(12) << cur_enc
+                      << std::setw(12) << (motor_ok ? std::to_string(cur_motor) : "?")
+                      << std::setw(12) << (enc_ok   ? std::to_string(cur_enc)   : "?")
                       << " |  "
-                      << std::setw(14) << (n_samples > 0 ? min_motor : 0)
-                      << std::setw(14) << (n_samples > 0 ? max_motor : 0)
-                      << std::setw(12) << (n_samples > 0 ? min_enc   : 0)
-                      << std::setw(12) << (n_samples > 0 ? max_enc   : 0)
+                      << std::setw(14) << (n_samples > 0 ? std::to_string(min_motor) : "-")
+                      << std::setw(14) << (n_samples > 0 ? std::to_string(max_motor) : "-")
+                      << std::setw(12) << (n_samples > 0 ? std::to_string(min_enc)   : "-")
+                      << std::setw(12) << (n_samples > 0 ? std::to_string(max_enc)   : "-")
                       << n_samples
                       << std::flush;
         }
 
+        // Completar ciclo de 20 ms (ya dormimos 10ms + drain ~5ms → ~5ms restantes)
         const auto elapsed   = std::chrono::steady_clock::now() - t0;
         const auto remaining = std::chrono::milliseconds(20) - elapsed;
         if (remaining > std::chrono::milliseconds(0))
@@ -213,11 +323,16 @@ int main(int argc, char* argv[])
 
     if (n_samples < 10) {
         std::cout << "Pocas muestras (" << n_samples << "), datos insuficientes.\n";
+        if (!motor_ok)
+            std::cout << "  → MOTOR: ningún frame TPDO21 recibido en COB-ID 0x"
+                      << std::hex << expected_motor_cob << std::dec << "\n";
+        if (!enc_ok)
+            std::cout << "  → ENCODER: ningún frame TPDO1 recibido en COB-ID 0x"
+                      << std::hex << expected_enc_cob << std::dec << "\n";
         can.close();
         return 1;
     }
 
-    // Por convenio URDF: actuator_encoder_left > 0 (izquierda), < 0 (derecha)
     const bool left_is_max     = (std::abs(max_motor) >= std::abs(min_motor));
     const int32_t act_left     = left_is_max ? max_motor        : min_motor;
     const int32_t act_right    = left_is_max ? min_motor        : max_motor;
